@@ -295,10 +295,15 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
       playSuccessChime();
       triggerVibration();
 
-      onScanSuccessRef.current({
-        rawText: cleaned,
-        source,
-        scanType: explicitScanType,
+      Promise.resolve(
+        onScanSuccessRef.current({
+          rawText: cleaned,
+          source,
+          scanType: explicitScanType,
+        })
+      ).catch((err) => {
+        console.error('Scan handler error:', err);
+        setCameraError('ไม่สามารถบันทึกผลการสแกนได้ กรุณาลองสแกนใหม่อีกครั้ง');
       });
     },
     [clearScanTimers]
@@ -378,13 +383,15 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
     };
   }, []);
 
-  // Dual engine camera scan loop (Hardware BarcodeDetector + Center Crop jsQR)
+  // Dual engine camera scan loop (Hardware BarcodeDetector with timeout + Dual-Pass jsQR)
   const scanLoop = useCallback(async () => {
     if (!isCameraActiveRef.current || !videoRef.current || !canvasRef.current) return;
 
     const video = videoRef.current;
     if (
-      video.readyState === video.HAVE_ENOUGH_DATA &&
+      video.readyState >= video.HAVE_CURRENT_DATA &&
+      video.videoWidth > 0 &&
+      video.videoHeight > 0 &&
       !isCooldownRef.current &&
       !isDetectingRef.current
     ) {
@@ -395,7 +402,10 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
 
         if (barcodeDetectorRef.current) {
           try {
-            const barcodes = await barcodeDetectorRef.current.detect(video);
+            const barcodes = await Promise.race([
+              barcodeDetectorRef.current.detect(video),
+              new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 220)),
+            ]);
             if (barcodes && barcodes.length > 0 && barcodes[0]?.rawValue) {
               detectedText = barcodes[0].rawValue;
             }
@@ -409,35 +419,38 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
           const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
           if (ctx) {
-            const vw = video.videoWidth || 640;
-            const vh = video.videoHeight || 480;
+            const vw = video.videoWidth;
+            const vh = video.videoHeight;
 
-            const cropSize = Math.min(vw, vh) * 0.65;
-            const cropX = (vw - cropSize) / 2;
-            const cropY = (vh - cropSize) / 2;
+            if (frameCountRef.current % 2 === 1) {
+              // Odd frames: high-res center 72% square crop
+              const cropSize = Math.min(vw, vh) * 0.72;
+              const cropX = Math.max(0, (vw - cropSize) / 2);
+              const cropY = Math.max(0, (vh - cropSize) / 2);
 
-            const targetSize = 420;
-            canvas.width = targetSize;
-            canvas.height = targetSize;
+              const targetSize = 460;
+              canvas.width = targetSize;
+              canvas.height = targetSize;
 
-            ctx.drawImage(video, cropX, cropY, cropSize, cropSize, 0, 0, targetSize, targetSize);
+              ctx.drawImage(video, cropX, cropY, cropSize, cropSize, 0, 0, targetSize, targetSize);
 
-            const imageData = ctx.getImageData(0, 0, targetSize, targetSize);
-            const code = jsQR(imageData.data, imageData.width, imageData.height, {
-              inversionAttempts: 'attemptBoth',
-            });
-
-            if (code && code.data) {
-              detectedText = code.data;
-            } else if (frameCountRef.current % 4 === 0) {
-              const fullTargetW = 480;
-              const fullTargetH = Math.round((vh / vw) * 480);
+              const imageData = ctx.getImageData(0, 0, targetSize, targetSize);
+              const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                inversionAttempts: 'attemptBoth',
+              });
+              if (code && code.data) {
+                detectedText = code.data;
+              }
+            } else {
+              // Even frames: full frame scan for wider/angled QR cards
+              const fullTargetW = 520;
+              const fullTargetH = Math.max(240, Math.round((vh / vw) * fullTargetW));
               canvas.width = fullTargetW;
               canvas.height = fullTargetH;
               ctx.drawImage(video, 0, 0, fullTargetW, fullTargetH);
               const fullImgData = ctx.getImageData(0, 0, fullTargetW, fullTargetH);
               const fallbackCode = jsQR(fullImgData.data, fullImgData.width, fullImgData.height, {
-                inversionAttempts: 'dontInvert',
+                inversionAttempts: 'attemptBoth',
               });
               if (fallbackCode && fallbackCode.data) {
                 detectedText = fallbackCode.data;
@@ -459,8 +472,9 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
     }
   }, [triggerScanFound]);
 
-  // Start real camera
-  const startScanner = async () => {
+  // Start real camera with progressive constraint fallbacks
+  const startScanner = async (overrideFacingMode?: 'environment' | 'user') => {
+    const targetFacing = overrideFacingMode || facingMode;
     setScanMode('camera');
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -469,38 +483,62 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
 
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
       }
 
-      const constraints: MediaStreamConstraints = {
-        video: {
-          facingMode: { ideal: facingMode },
-          width: { ideal: 1280, min: 640 },
-          height: { ideal: 720, min: 480 },
-          // @ts-expect-error focusMode is standard in mobile MediaTrackConstraints
-          focusMode: { ideal: 'continuous' },
-        },
-        audio: false,
-      };
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: targetFacing },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        });
+      } catch {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: targetFacing } },
+            audio: false,
+          });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false,
+          });
+        }
+      }
 
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       streamRef.current = stream;
 
       const track = stream.getVideoTracks()[0];
       if (track) {
-        await applyAutofocusConstraints(track);
+        void applyAutofocusConstraints(track);
       }
 
       if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.setAttribute('playsinline', 'true');
-        await videoRef.current.play();
+        const videoEl = videoRef.current;
+        videoEl.srcObject = stream;
+        videoEl.setAttribute('playsinline', 'true');
+        videoEl.muted = true;
+
+        // Reveal video element before play() so Safari/Android WebView decodes dimensions immediately
+        setIsCameraActive(true);
+        isCameraActiveRef.current = true;
+        onCameraActiveChange?.(true);
+
+        await videoEl.play().catch(() => {});
+      } else {
+        setIsCameraActive(true);
+        isCameraActiveRef.current = true;
+        onCameraActiveChange?.(true);
       }
 
-      setIsCameraActive(true);
       setCameraError(null);
-      onCameraActiveChange?.(true);
     } catch (err: unknown) {
       console.warn('Camera start error:', err);
+      stopScanner();
       const msg = err instanceof Error ? err.message : String(err);
       setCameraError(
         msg.includes('Permission') || msg.includes('NotAllowed')
@@ -632,7 +670,7 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
     fileInputRef.current?.click();
   };
 
-  // Upload image file to scan QR
+  // Upload image file to scan QR (with downscale + center-crop pass for high-res phone photos)
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -641,18 +679,38 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
     reader.onload = (event) => {
       const img = new Image();
       img.onload = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.width;
-        canvas.height = img.height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-        ctx.drawImage(img, 0, 0);
+        const maxDim = 1024;
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const targetW = Math.max(1, Math.round(img.width * scale));
+        const targetH = Math.max(1, Math.round(img.height * scale));
 
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const code = jsQR(imgData.data, imgData.width, imgData.height, {
+        const canvas = document.createElement('canvas');
+        canvas.width = targetW;
+        canvas.height = targetH;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0, targetW, targetH);
+
+        const imgData = ctx.getImageData(0, 0, targetW, targetH);
+        let code = jsQR(imgData.data, imgData.width, imgData.height, {
           inversionAttempts: 'attemptBoth',
         });
+
+        if (!code || !code.data) {
+          const cropSize = Math.min(img.width, img.height) * 0.7;
+          const cropX = (img.width - cropSize) / 2;
+          const cropY = (img.height - cropSize) / 2;
+          canvas.width = 600;
+          canvas.height = 600;
+          ctx.drawImage(img, cropX, cropY, cropSize, cropSize, 0, 0, 600, 600);
+          const cropImg = ctx.getImageData(0, 0, 600, 600);
+          code = jsQR(cropImg.data, cropImg.width, cropImg.height, {
+            inversionAttempts: 'attemptBoth',
+          });
+        }
+
         if (code && code.data) {
+          setCameraError(null);
           triggerScanFound(code.data, 'upload');
         } else {
           setCameraError('ไม่พบ QR Code ในรูปภาพที่เลือก กรุณาลองรูปใหม่อีกครั้ง');
@@ -706,15 +764,16 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
         {/* Hidden Canvas for QR frame processing */}
         <canvas ref={canvasRef} style={{ display: 'none' }} />
 
-        {/* Video stream when camera active */}
+        {/* Video stream kept mounted & visible to compositor so dimensions & frames decode immediately */}
         <div id="qr-reader" className="qr-reader">
           <video
             ref={videoRef}
             playsInline
             autoPlay
             muted
-            className="w-full h-full object-cover"
-            style={{ display: isCameraActive ? 'block' : 'none' }}
+            className={`w-full h-full object-cover transition-opacity duration-150 ${
+              isCameraActive ? 'opacity-100' : 'opacity-0 pointer-events-none'
+            }`}
           />
         </div>
 
@@ -837,7 +896,7 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
                   <button
                     className="btn-ios-primary w-full min-h-[44px] flex items-center justify-center gap-2"
                     id="btnStartScan"
-                    onClick={startScanner}
+                    onClick={() => void startScanner()}
                     type="button"
                   >
                     <span>เปิดกล้องสแกน</span>
@@ -1024,7 +1083,7 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
                 const nextMode = facingMode === 'environment' ? 'user' : 'environment';
                 setFacingMode(nextMode);
                 stopScanner();
-                setTimeout(() => startScanner(), 100);
+                setTimeout(() => void startScanner(nextMode), 100);
               }}
               type="button"
               title="สลับกล้อง"

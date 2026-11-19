@@ -27,7 +27,7 @@ import {
   Upload,
   Printer,
 } from 'lucide-react';
-import { Student, ScanRecord, Car, AdminTab, AppUser, SystemSetting } from '../types';
+import { Student, ScanRecord, Car, AdminTab, AppUser, SystemSetting, RealtimeSyncSnapshot } from '../types';
 import { GoogleSheetsPanel } from './GoogleSheetsPanel';
 import { FirebasePanel } from './FirebasePanel';
 import { isFirebaseReady } from '../services/firebaseClient';
@@ -68,6 +68,7 @@ interface AdminDashboardProps {
   isSyncingSheets?: boolean;
   onSyncFromFirebase?: () => Promise<void>;
   isSyncingFirebase?: boolean;
+  syncSnapshot?: RealtimeSyncSnapshot;
   onClearMockStudents?: () => void;
   onOpenFirebaseAuth?: () => void;
   initialTab?: AdminTab;
@@ -104,6 +105,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   isSyncingSheets = false,
   onSyncFromFirebase,
   isSyncingFirebase = false,
+  syncSnapshot,
   onClearMockStudents,
   onImportStudents,
   onOpenFirebaseAuth,
@@ -279,6 +281,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       qrImage: `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(studentCode)}`,
       qr_image: `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(studentCode)}`,
       qrUrl: `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(studentCode)}`,
+      updated_at: editingStudent?.updated_at,
     };
 
     if (editingStudent) {
@@ -336,6 +339,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       attendant: formCarAttendant.trim() || 'เจ้าหน้าที่ประจำรถ',
       capacity: Number(formCarCapacity) || 60,
       status: formCarStatus,
+      updated_at: editingCar?.updated_at,
     };
 
     if (editingCar) {
@@ -606,18 +610,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           ←
         </button>
         <div className="admin-title text-center">
-          <div className="flex items-center justify-center gap-2">
+          <div className="flex items-center justify-center gap-2 flex-wrap">
             <strong className="text-sm font-bold text-white">ระบบจัดการหลังบ้าน</strong>
-            {firebaseConnected ? (
-              <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                Firebase Real-time 100%
-              </span>
-            ) : (
-              <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                กำลังเชื่อมต่อ Firebase...
-              </span>
-            )}
+            {(() => {
+              const st = syncSnapshot?.status;
+              if (!firebaseConnected || st === 'syncing') {
+                return (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                    <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+                    กำลังซิงค์ Firebase...
+                  </span>
+                );
+              }
+              if (st === 'offline') {
+                return (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                    โหมดออฟไลน์ · รอซิงค์
+                  </span>
+                );
+              }
+              if (st === 'error') {
+                return (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                    เชื่อมต่อขัดข้อง
+                  </span>
+                );
+              }
+              if (st === 'pending') {
+                return (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                    รอซิงค์ Server ({syncSnapshot?.pendingWritesCount ?? 0})
+                  </span>
+                );
+              }
+              return (
+                <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  {syncSnapshot?.fromCache ? 'Firebase Real-time (Cache)' : 'Firebase Real-time (Server)'}
+                </span>
+              );
+            })()}
           </div>
           <span className="text-xs text-slate-400">แอดมินระบบเช็คอินรถรับส่ง</span>
         </div>
@@ -1920,6 +1953,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               scanCount={scans.length}
               users={users}
               settings={settings}
+              syncSnapshot={syncSnapshot}
               onSyncFromFirebase={onSyncFromFirebase}
               isSyncingFirebase={isSyncingFirebase}
               onUpsertUser={onUpsertUser}

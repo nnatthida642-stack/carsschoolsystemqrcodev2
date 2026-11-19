@@ -2,12 +2,12 @@
 
 ## 1. Data Invariants (Shared Multi-Device Terminal Mode — No Google Sign-In Required)
 1. **Immediate Shared Access Without Google Login**: Devices connect directly to Cloud Firestore without requiring Google Account sign-in, allowing all scanner terminals to immediately view scans, students, cars, users, and settings synced from other devices in real time.
-2. **Strict Schema & No Shadow Fields**: Every collection (`students`, `cars`, `scans`, `users`, `settings`) enforces an `isValid[Entity](data)` blueprint helper with `keys().hasAll(...)` and `keys().hasOnly(...)`, strict field types, and `.size()` bounds on every string.
-3. **Path Variable Hardening (`isValidId`)**: All document IDs (`studentId`, `carId`, `scanId`, `userId`, `settingKey`), payload IDs (`scan_id`, etc.), and `ownerId` fields must match `^[a-zA-Z0-9_\-]+$` with length 1–128 characters. `scans` supports Firestore auto-generated IDs via `addDoc()` while enforcing `isValidId(scanId)` and `isValidId(incoming().scan_id)`.
+2. **Strict Schema & No Shadow Fields**: Every collection (`students`, `cars`, `scans`, `users`, `settings`, `devices`) enforces an `isValid[Entity](data)` blueprint helper with `keys().hasAll(...)` and `keys().hasOnly(...)`, strict field types, and `.size()` bounds on every string.
+3. **Path Variable Hardening (`isValidId`) & Deterministic Scan IDs**: All document IDs (`studentId`, `carId`, `scanId`, `userId`, `settingKey`, `deviceId`), payload IDs (`scan_id`, etc.), and `ownerId` fields must match `^[a-zA-Z0-9_\-]+$` with length 1–128 characters. `scans/{scanId}` uses deterministic document IDs (`setDoc(doc(db, 'scans', scanId), payload)`) enforcing `incoming().scan_id == scanId` on create and `student_id.size() >= 1`.
 4. **Temporal Integrity (`createdAt`, `updatedAt`)**: Server timestamps (`request.time`) are strictly enforced on `create` (`createdAt == request.time && updatedAt == request.time`) and `update` (`createdAt == existing().createdAt && updatedAt == request.time`).
-5. **Immutable Identity Fields**: `student_id`, `car_id`, `scan_id`, `user_id`, `key`, `ownerId`, and `createdAt` cannot be modified on update (`incoming().field == existing().field`).
+5. **Immutable Identity Fields**: `student_id`, `car_id`, `scan_id`, `user_id`, `key`, `device_id`, `ownerId`, and `createdAt` cannot be modified on update (`incoming().field == existing().field`).
 6. **Bounded Queries (`request.query.limit`)**: All `allow list` rules enforce bounded `request.query.limit` checks (supporting `orderBy('timestamp', 'desc')` + `limit(...)` on `scans`) with zero `get()` or `exists()` calls inside `allow list`.
-7. **Admin Registry Lockdown**: `/admins/{userId}` denies all client reads and writes (`allow read, write: if false;`).
+7. **Admin Registry Lockdown**: `/admins/{userId}` denies all client reads and writes (`allow read, write: if false;`). `/devices/{deviceId}` denies client deletion (`allow delete: if false;`).
 
 ## 2. Adversarial Payloads Covered
 1. **Default-Deny Catch-All**: Unmatched path `/unknown/doc1` -> `PERMISSION_DENIED`.

@@ -108,7 +108,7 @@ service cloud.firestore {
       (!('dateThai' in data) || isNullableString(data.dateThai, 50)) &&
       data.scan_time is string && data.scan_time.size() <= 30 &&
       (!('timeThai' in data) || isNullableString(data.timeThai, 50)) &&
-      data.student_id is string && data.student_id.size() <= 128 &&
+      data.student_id is string && data.student_id.size() >= 1 && data.student_id.size() <= 128 &&
       data.student_name is string && data.student_name.size() >= 1 && data.student_name.size() <= 200 &&
       (!('grade' in data) || isNullableString(data.grade, 100)) &&
       (!('room' in data) || isNullableString(data.room, 50)) &&
@@ -163,11 +163,30 @@ service cloud.firestore {
       data.updatedAt is timestamp;
     }
 
+    function isValidDevice(data) {
+      return data.keys().hasAll([
+        'device_id', 'role', 'status', 'last_seen', 'ownerId', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'device_id', 'role', 'platform', 'user_agent', 'auth_uid', 'status', 'last_seen', 'ownerId', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.device_id) &&
+      data.role in ['Admin', 'Staff', 'Viewer'] &&
+      (!('platform' in data) || isNullableString(data.platform, 100)) &&
+      (!('user_agent' in data) || isNullableString(data.user_agent, 250)) &&
+      (!('auth_uid' in data) || isNullableString(data.auth_uid, 128)) &&
+      data.status is string && data.status.size() >= 1 && data.status.size() <= 50 &&
+      data.last_seen is number && data.last_seen >= 0 &&
+      isValidId(data.ownerId) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
     // ========================================================
     // Shared Multi-Device Collection Rules (No Google Login Required)
     // ========================================================
     match /students/{studentId} {
-      allow get: if isValidId(studentId) && existing().student_id == studentId;
+      allow get: if isValidId(studentId) && (resource == null || existing().student_id == studentId);
       allow list: if request.query.limit != null && request.query.limit <= 5000;
 
       allow create: if isValidId(studentId) &&
@@ -193,7 +212,7 @@ service cloud.firestore {
     }
 
     match /cars/{carId} {
-      allow get: if isValidId(carId) && existing().car_id == carId;
+      allow get: if isValidId(carId) && (resource == null || existing().car_id == carId);
       allow list: if request.query.limit != null && request.query.limit <= 500;
 
       allow create: if isValidId(carId) &&
@@ -217,11 +236,12 @@ service cloud.firestore {
     }
 
     match /scans/{scanId} {
-      allow get: if isValidId(scanId) && existing().scan_type in ['ขึ้นรถ', 'ลงรถ'];
+      allow get: if isValidId(scanId) && (resource == null || existing().scan_type in ['ขึ้นรถ', 'ลงรถ']);
       allow list: if request.query.limit != null && request.query.limit <= 10000;
 
       allow create: if isValidId(scanId) &&
         isValidScan(incoming()) &&
+        incoming().scan_id == scanId &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
 
@@ -243,7 +263,7 @@ service cloud.firestore {
     }
 
     match /users/{userId} {
-      allow get: if isValidId(userId) && existing().user_id == userId;
+      allow get: if isValidId(userId) && (resource == null || existing().user_id == userId);
       allow list: if existing().role in ['Admin', 'Staff', 'Viewer'] &&
         request.query.limit != null && request.query.limit <= 500;
 
@@ -267,7 +287,7 @@ service cloud.firestore {
     }
 
     match /settings/{settingKey} {
-      allow get: if isValidId(settingKey) && existing().key == settingKey;
+      allow get: if isValidId(settingKey) && (resource == null || existing().key == settingKey);
       allow list: if request.query.limit != null && request.query.limit <= 500;
 
       allow create: if isValidId(settingKey) &&
@@ -287,6 +307,29 @@ service cloud.firestore {
         ]);
 
       allow delete: if isValidId(settingKey) && existing().key == settingKey;
+    }
+
+    match /devices/{deviceId} {
+      allow get: if isValidId(deviceId) && (resource == null || existing().device_id == deviceId);
+      allow list: if request.query.limit != null && request.query.limit <= 500;
+
+      allow create: if isValidId(deviceId) &&
+        isValidDevice(incoming()) &&
+        incoming().device_id == deviceId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(deviceId) &&
+        isValidDevice(incoming()) &&
+        incoming().device_id == existing().device_id &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'role', 'platform', 'user_agent', 'auth_uid', 'status', 'last_seen', 'updatedAt'
+        ]);
+
+      allow delete: if false;
     }
 
     match /admins/{userId} {

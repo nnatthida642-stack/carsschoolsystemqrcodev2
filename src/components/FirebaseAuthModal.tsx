@@ -11,6 +11,7 @@ import {
   UploadCloud,
   Wifi,
 } from 'lucide-react';
+import { RealtimeSyncSnapshot } from '../types';
 import {
   FIREBASE_PROJECT_ID,
   FIRESTORE_DATABASE_ID,
@@ -33,6 +34,7 @@ interface FirebaseAuthModalProps {
   studentCount: number;
   carCount: number;
   scanCount: number;
+  syncSnapshot?: RealtimeSyncSnapshot;
   onSyncComplete?: () => Promise<void> | void;
   onOpenFullFirebaseTab?: () => void;
 }
@@ -43,6 +45,7 @@ export const FirebaseAuthModal: React.FC<FirebaseAuthModalProps> = ({
   studentCount,
   carCount,
   scanCount,
+  syncSnapshot,
   onSyncComplete,
   onOpenFullFirebaseTab,
 }) => {
@@ -199,19 +202,29 @@ export const FirebaseAuthModal: React.FC<FirebaseAuthModalProps> = ({
             <div className="flex-1 min-w-0">
               <div className="font-semibold text-white flex flex-wrap items-center gap-2">
                 <span>
-                  {isConnected
-                    ? 'เชื่อมต่อ Firebase Firestore อัตโนมัติ 100%'
-                    : 'กำลังเตรียมการเชื่อมต่อ Firebase Firestore'}
+                  {!isConnected
+                    ? 'กำลังเตรียมการเชื่อมต่อ Firebase Firestore'
+                    : syncSnapshot?.status === 'offline'
+                    ? 'โหมดออฟไลน์ — พร้อมซิงค์อัตโนมัติเมื่อออนไลน์'
+                    : syncSnapshot?.status === 'error'
+                    ? 'การเชื่อมต่อ Firestore ขัดข้อง'
+                    : syncSnapshot?.status === 'syncing'
+                    ? 'กำลังซิงค์ข้อมูลแบบ Real-time...'
+                    : 'เชื่อมต่อ Firebase Firestore อัตโนมัติ 100%'}
                 </span>
                 <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono">
-                  ไม่ต้องล็อกอิน Google
+                  {syncSnapshot?.fromCache ? 'แคชในเครื่อง' : 'Server Live'}
                 </span>
               </div>
               <div className="text-[11px] opacity-90 mt-1 truncate">
-                เครื่องนี้: <span className="font-mono text-amber-300">{deviceId}</span> (DB: {FIRESTORE_DATABASE_ID.slice(0, 18)}...)
+                เครื่องนี้: <span className="font-mono text-amber-300">{deviceId}</span> · บทบาท:{' '}
+                <span className="font-mono text-cyan-300">{syncSnapshot?.deviceRole || 'Staff'}</span> · DB:{' '}
+                {FIRESTORE_DATABASE_ID.slice(0, 14)}...
               </div>
               <div className="text-[11px] text-emerald-300/90 mt-0.5">
-                เห็นรายการสแกนจากทุกเครื่องแบบ Real-time ทันทีที่เปิดแอป
+                {syncSnapshot?.lastSyncedAt
+                  ? `ซิงค์ล่าสุด: ${new Date(syncSnapshot.lastSyncedAt).toLocaleTimeString('th-TH', { hour12: false })} (Listeners: ${syncSnapshot.activeListeners})`
+                  : 'เห็นรายการสแกนจากทุกเครื่องแบบ Real-time ทันทีที่เปิดแอป'}
               </div>
 
               {isConnected && (

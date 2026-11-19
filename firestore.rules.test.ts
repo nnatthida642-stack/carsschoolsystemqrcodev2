@@ -17,15 +17,15 @@ describe('Firestore Rules Static Verification & Coverage', () => {
 
   it('verifies all blueprint collections have dedicated match blocks and validation helpers', () => {
     const content = fs.readFileSync(RULES_PATH, 'utf8');
-    for (const col of ['students', 'cars', 'scans', 'users', 'settings', 'admins']) {
+    for (const col of ['students', 'cars', 'scans', 'users', 'settings', 'devices', 'admins']) {
       assert.ok(content.includes(`match /${col}/`), `Missing match block for ${col}`);
     }
-    for (const helper of ['isValidStudent', 'isValidCar', 'isValidScan', 'isValidAppUser', 'isValidSetting']) {
+    for (const helper of ['isValidStudent', 'isValidCar', 'isValidScan', 'isValidAppUser', 'isValidSetting', 'isValidDevice']) {
       assert.ok(content.includes(`function ${helper}(`), `Missing helper ${helper}`);
     }
   });
 
-  it('verifies no get() or exists() calls inside allow list blocks and enforces bounded queries', () => {
+  it('verifies no get() or exists() calls inside allow list blocks and enforces bounded queries and deterministic scans', () => {
     const content = fs.readFileSync(RULES_PATH, 'utf8');
     const listLines = content.split('\n').filter((line) => line.includes('allow list:'));
     for (const line of listLines) {
@@ -36,5 +36,8 @@ describe('Firestore Rules Static Verification & Coverage', () => {
     assert.ok(content.includes('request.query.limit != null'), 'allow list must bound query limit');
     assert.ok(content.includes("'barcode_scanner'"), 'isValidScan must allow barcode_scanner scan_source');
     assert.ok(content.includes("'room'"), 'isValidScan must allow room field');
+    assert.ok(content.includes('incoming().scan_id == scanId'), 'scans create must enforce deterministic scan_id == scanId');
+    assert.ok(content.includes('data.student_id.size() >= 1'), 'isValidScan must enforce non-empty student_id');
+    assert.ok(content.includes('resource == null || existing().device_id == deviceId'), 'devices get must handle non-existent docs cleanly');
   });
 });

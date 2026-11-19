@@ -257,6 +257,7 @@
         },
         "student_id": {
           "type": "string",
+          "minLength": 1,
           "maxLength": 128,
           "description": "Scanned student ID"
         },
@@ -494,6 +495,77 @@
         "updatedAt"
       ]
     },
+    "DeviceTerminal": {
+      "title": "DeviceTerminal",
+      "description": "Registered scanner terminal device metadata and session role.",
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique terminal device identifier"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["Admin", "Staff", "Viewer"],
+          "maxLength": 30,
+          "description": "Active terminal role"
+        },
+        "platform": {
+          "type": ["string", "null"],
+          "maxLength": 100,
+          "description": "Browser/OS platform string"
+        },
+        "user_agent": {
+          "type": ["string", "null"],
+          "maxLength": 250,
+          "description": "Browser user agent summary"
+        },
+        "auth_uid": {
+          "type": ["string", "null"],
+          "maxLength": 128,
+          "description": "Optional Firebase Auth UID"
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50,
+          "description": "Device online status"
+        },
+        "last_seen": {
+          "type": "number",
+          "description": "Epoch milliseconds when terminal last checked in"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Device owner identifier"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "device_id",
+        "role",
+        "status",
+        "last_seen",
+        "ownerId",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
     "AdminRole": {
       "title": "AdminRole",
       "description": "Admin role assignment document keyed by Firebase Auth UID.",
@@ -540,6 +612,10 @@
     "/settings/{settingKey}": {
       "schema": { "$ref": "#/entities/SystemSetting" },
       "description": "Collection of system-wide configuration settings"
+    },
+    "/devices/{deviceId}": {
+      "schema": { "$ref": "#/entities/DeviceTerminal" },
+      "description": "Collection of active scanner terminal registrations"
     },
     "/admins/{userId}": {
       "schema": { "$ref": "#/entities/AdminRole" },

@@ -15,7 +15,7 @@ import {
   X,
   Wifi,
 } from 'lucide-react';
-import { AppUser, SystemSetting } from '../types';
+import { AppUser, SystemSetting, RealtimeSyncSnapshot } from '../types';
 import {
   FIREBASE_PROJECT_ID,
   FIRESTORE_DATABASE_ID,
@@ -32,6 +32,7 @@ interface FirebasePanelProps {
   scanCount: number;
   users: AppUser[];
   settings: SystemSetting[];
+  syncSnapshot?: RealtimeSyncSnapshot;
   onSyncFromFirebase?: () => Promise<void>;
   isSyncingFirebase?: boolean;
   onUpsertUser?: (user: AppUser) => Promise<void>;
@@ -46,6 +47,7 @@ export const FirebasePanel: React.FC<FirebasePanelProps> = ({
   scanCount,
   users,
   settings,
+  syncSnapshot,
   onSyncFromFirebase,
   isSyncingFirebase = false,
   onUpsertUser,
@@ -148,6 +150,7 @@ export const FirebasePanel: React.FC<FirebasePanelProps> = ({
       role: userRoleInput,
       car_id: userCarInput.trim() || 'ALL',
       status: userStatusInput,
+      updated_at: editingUser?.updated_at,
     });
     resetUserForm();
   };
@@ -175,6 +178,7 @@ export const FirebasePanel: React.FC<FirebasePanelProps> = ({
       key: settingKeyInput.trim(),
       value: settingValueInput.trim(),
       description: settingDescInput.trim(),
+      updated_at: editingSetting?.updated_at,
     });
     resetSettingForm();
   };
@@ -203,16 +207,50 @@ export const FirebasePanel: React.FC<FirebasePanelProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-xs font-semibold">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-xs font-semibold flex-wrap">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  syncSnapshot?.status === 'error'
+                    ? 'bg-rose-400'
+                    : syncSnapshot?.status === 'offline'
+                    ? 'bg-amber-400'
+                    : 'bg-emerald-400 animate-pulse'
+                }`}
+              />
               <Wifi className="w-3.5 h-3.5" />
-              <span>ซิงค์ข้ามเครื่องอัตโนมัติ (ไม่ต้องล็อกอิน Google)</span>
+              <span>
+                {syncSnapshot?.status === 'offline'
+                  ? 'ออฟไลน์ · รอซิงค์อัตโนมัติ'
+                  : syncSnapshot?.status === 'error'
+                  ? 'การเชื่อมต่อขัดข้อง'
+                  : syncSnapshot?.status === 'pending'
+                  ? `รอซิงค์ (${syncSnapshot.pendingWritesCount})`
+                  : syncSnapshot?.fromCache
+                  ? 'ซิงค์ข้ามเครื่อง (Cache)'
+                  : 'ซิงค์ข้ามเครื่องแบบ Server Live'}
+              </span>
               <span className="px-1.5 py-0.5 rounded bg-slate-900/70 text-amber-300 text-[10px] font-mono">
                 {deviceId}
               </span>
+              {syncSnapshot && (
+                <span className="px-1.5 py-0.5 rounded bg-slate-900/70 text-cyan-300 text-[10px] font-mono">
+                  Listeners: {syncSnapshot.activeListeners} · {syncSnapshot.deviceRole}
+                </span>
+              )}
             </div>
           </div>
         </div>
+        {syncSnapshot?.lastSyncedAt && (
+          <div className="text-[11px] text-slate-400 mt-2">
+            อัปเดตข้อมูลจาก Firestore ล่าสุด:{' '}
+            <span className="font-mono text-emerald-300">
+              {new Date(syncSnapshot.lastSyncedAt).toLocaleString('th-TH', { hour12: false })}
+            </span>
+            {syncSnapshot.fromCache && (
+              <span className="ml-2 text-sky-300">(ข้อมูลจากแคชในเครื่อง)</span>
+            )}
+          </div>
+        )}
 
         {/* Live Collection Counters */}
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-5 pt-4 border-t border-white/10">
@@ -380,9 +418,15 @@ export const FirebasePanel: React.FC<FirebasePanelProps> = ({
             </p>
           </div>
           <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800 space-y-1">
-            <div className="font-mono text-sky-400 font-bold">/admins/{'{userId}'}</div>
+            <div className="font-mono text-sky-400 font-bold">/devices/{'{deviceId}'}</div>
             <p className="text-[11px] text-slate-400">
-              uid, email, createdAt (สิทธิ์ผู้ดูแลระบบเพิ่มเติม)
+              device_id, role (Admin / Staff / Viewer), platform, status, last_seen, ownerId
+            </p>
+          </div>
+          <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800 space-y-1">
+            <div className="font-mono text-slate-400 font-bold">/admins/{'{userId}'}</div>
+            <p className="text-[11px] text-slate-400">
+              uid, email, createdAt (ล็อกสิทธิ์ระดับเซิร์ฟเวอร์)
             </p>
           </div>
         </div>

@@ -15,7 +15,7 @@ import {
   ScanBarcode,
   Camera,
 } from 'lucide-react';
-import { ScanRecord, Car, Student } from '../types';
+import { ScanRecord, Car, Student, RealtimeSyncSnapshot } from '../types';
 import { DailySummaryModal } from './DailySummaryModal';
 
 const AUTO_COLLAPSE_DELAY_MS = 5000;
@@ -34,8 +34,10 @@ interface ScanListHalfProps {
   cameraActive?: boolean;
   isOnline?: boolean;
   isFirebaseConnected?: boolean;
+  syncSnapshot?: RealtimeSyncSnapshot;
   hasMoreScans?: boolean;
   isLoadingMoreScans?: boolean;
+  latestHighlightedScanId?: string | null;
   onLoadMoreScans?: () => void;
   onRetryScan?: (scan: ScanRecord) => void;
   onSyncPending?: () => void;
@@ -55,8 +57,10 @@ export const ScanListHalf: React.FC<ScanListHalfProps> = ({
   cameraActive = false,
   isOnline = true,
   isFirebaseConnected = true,
+  syncSnapshot,
   hasMoreScans = false,
   isLoadingMoreScans = false,
+  latestHighlightedScanId = null,
   onLoadMoreScans,
   onRetryScan,
   onSyncPending,
@@ -91,9 +95,16 @@ export const ScanListHalf: React.FC<ScanListHalfProps> = ({
     prevScanCountRef.current = scans.length;
   }, [scans.length, isCollapsed, bumpActivity]);
 
-  // Auto-collapse after inactivity when expanded and not searching or viewing modals
+  // Auto-expand when a live scan arrives from another device while camera is off
   useEffect(() => {
-    if (isCollapsed || searchOpen || showConfirmClear || showDailyReport) {
+    if (latestHighlightedScanId && !cameraActive) {
+      setIsCollapsed(false);
+    }
+  }, [latestHighlightedScanId, cameraActive]);
+
+  // Auto-collapse after inactivity ONLY while actively scanning with camera
+  useEffect(() => {
+    if (!cameraActive || isCollapsed || searchOpen || showConfirmClear || showDailyReport) {
       return;
     }
 
@@ -102,7 +113,7 @@ export const ScanListHalf: React.FC<ScanListHalfProps> = ({
     }, AUTO_COLLAPSE_DELAY_MS);
 
     return () => window.clearTimeout(timer);
-  }, [isCollapsed, searchOpen, showConfirmClear, showDailyReport, activityTick]);
+  }, [cameraActive, isCollapsed, searchOpen, showConfirmClear, showDailyReport, activityTick]);
 
   const handleToggleCollapse = () => {
     setIsCollapsed((prev) => {
@@ -206,25 +217,54 @@ export const ScanListHalf: React.FC<ScanListHalfProps> = ({
         >
           <div className="flex items-center gap-1.5 flex-wrap">
             <h3>รายการสแกนวันนี้</h3>
-            <span
-              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-semibold border ${
-                isOnline && isFirebaseConnected
-                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                  : isOnline
+            {(() => {
+              const st = syncSnapshot?.status;
+              const isFromCache = syncSnapshot?.fromCache;
+              const badgeClass =
+                st === 'error'
+                  ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                  : st === 'offline' || !isOnline
+                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                  : st === 'pending'
+                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                  : st === 'syncing' || !isFirebaseConnected
                   ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
-                  : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-              }`}
-              title={
-                isOnline && isFirebaseConnected
-                  ? 'ออนไลน์ · เชื่อมต่อ Firebase Real-time แล้ว'
-                  : isOnline
-                  ? 'ออนไลน์ · กำลังเชื่อมต่อเซิร์ฟเวอร์'
-                  : 'ออฟไลน์ · ข้อมูลจะคิวไว้ในเครื่องแล้วซิงค์อัตโนมัติเมื่อออนไลน์'
-              }
-            >
-              {isOnline ? <Wifi className="w-2.5 h-2.5" /> : <WifiOff className="w-2.5 h-2.5" />}
-              <span>{isOnline ? (isFirebaseConnected ? 'ออนไลน์ · Live' : 'กำลังเชื่อม') : 'ออฟไลน์'}</span>
-            </span>
+                  : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+              const label =
+                st === 'error'
+                  ? 'เชื่อมต่อขัดข้อง'
+                  : st === 'offline' || !isOnline
+                  ? 'ออฟไลน์'
+                  : st === 'pending'
+                  ? `รอซิงค์ (${syncSnapshot?.pendingWritesCount ?? pendingCount})`
+                  : st === 'syncing' || !isFirebaseConnected
+                  ? 'กำลังซิงค์...'
+                  : isFromCache
+                  ? 'ออนไลน์ · Cache'
+                  : 'ออนไลน์ · Live';
+              const syncedTimeStr = syncSnapshot?.lastSyncedAt
+                ? new Date(syncSnapshot.lastSyncedAt).toLocaleTimeString('th-TH', { hour12: false })
+                : null;
+              return (
+                <span
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-semibold border ${badgeClass}`}
+                  title={
+                    syncSnapshot?.lastError
+                      ? `ข้อผิดพลาด: ${syncSnapshot.lastError}`
+                      : syncedTimeStr
+                      ? `อัปเดตล่าสุดจาก Firebase เมื่อ ${syncedTimeStr} (${isFromCache ? 'จากแคชในเครื่อง' : 'ยืนยันจาก Server แล้ว'})`
+                      : 'เชื่อมต่อ Firebase Real-time'
+                  }
+                >
+                  {isOnline && st !== 'offline' ? (
+                    <Wifi className={`w-2.5 h-2.5 ${st === 'syncing' ? 'animate-pulse' : ''}`} />
+                  ) : (
+                    <WifiOff className="w-2.5 h-2.5" />
+                  )}
+                  <span>{label}</span>
+                </span>
+              );
+            })()}
           </div>
           <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
             <span className="lh-count shrink-0" id="scanCount">
@@ -351,7 +391,15 @@ export const ScanListHalf: React.FC<ScanListHalfProps> = ({
 
       {/* Scan List */}
       <div className="scan-list" id="scanList" onScroll={bumpActivity}>
-        {filteredScans.length === 0 ? (
+        {syncSnapshot?.isInitialLoading && scans.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-10 text-center text-slate-400 space-y-2.5">
+            <div className="w-12 h-12 rounded-2xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center">
+              <RefreshCw className="w-5 h-5 text-sky-400 animate-spin" />
+            </div>
+            <p className="text-sm font-medium text-slate-200">กำลังโหลดข้อมูลแบบ Real-time จาก Firebase...</p>
+            <p className="text-xs text-slate-500">โปรดรอสักครู่ ระบบกำลังเชื่อมฐานข้อมูลกลางทุกอุปกรณ์</p>
+          </div>
+        ) : filteredScans.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-10 text-center text-slate-400 space-y-2">
             <div className="w-14 h-14 rounded-2xl bg-slate-800/80 flex items-center justify-center text-2xl border border-white/5">
               🚌
@@ -388,12 +436,26 @@ export const ScanListHalf: React.FC<ScanListHalfProps> = ({
                   ? 'บันทึกล้มเหลว'
                   : 'รอซิงค์');
 
+              const isLiveRemoteHighlight =
+                Boolean(latestHighlightedScanId) &&
+                (scan.scanId === latestHighlightedScanId || scan.id === latestHighlightedScanId);
+
               return (
                 <div
                   key={`scan-${scan.firestoreDocId || scan.id || scan.scanId || 'item'}-${index}`}
                   onClick={() => onSelectScan(scan)}
-                  className="bg-slate-800/80 hover:bg-slate-800 border border-white/5 hover:border-amber-500/30 rounded-2xl p-3.5 flex flex-col gap-2 cursor-pointer transition-all active:scale-[0.98] shadow-sm group"
+                  className={`border rounded-2xl p-3.5 flex flex-col gap-2 cursor-pointer transition-all active:scale-[0.98] shadow-sm group ${
+                    isLiveRemoteHighlight
+                      ? 'bg-emerald-950/40 border-emerald-400/70 ring-1 ring-emerald-400/40'
+                      : 'bg-slate-800/80 hover:bg-slate-800 border-white/5 hover:border-amber-500/30'
+                  }`}
                 >
+                  {isLiveRemoteHighlight && (
+                    <div className="flex items-center justify-between text-[10px] font-bold text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 rounded-lg px-2 py-0.5">
+                      <span>📡 ซิงค์เข้าใหม่แบบ Real-time จากเครื่องอื่น</span>
+                      <span className="animate-pulse">LIVE</span>
+                    </div>
+                  )}
                   {/* Row 1: Name, Code, Grade, Room, Bus + Plate & Sync/Boarding Badges */}
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex items-center gap-2.5 min-w-0">
@@ -442,11 +504,23 @@ export const ScanListHalf: React.FC<ScanListHalfProps> = ({
                       <div className="flex items-center gap-1">
                         {syncState === 'synced' ? (
                           <span
-                            className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1"
-                            title="บันทึกและซิงค์กับ Firebase Cloud Firestore สำเร็จ"
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border flex items-center gap-1 ${
+                              scan.fromCache
+                                ? 'bg-sky-500/20 text-sky-300 border-sky-500/30'
+                                : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                            }`}
+                            title={
+                              scan.fromCache
+                                ? 'อ่านจากแคชในเครื่อง (กำลังรอตรวจสอบล่าสุดจากเซิร์ฟเวอร์)'
+                                : 'บันทึกและยืนยันจาก Firebase Cloud Server แล้ว'
+                            }
                           >
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                            Synced
+                            <span
+                              className={`w-1.5 h-1.5 rounded-full ${
+                                scan.fromCache ? 'bg-sky-400' : 'bg-emerald-400'
+                              }`}
+                            ></span>
+                            {scan.fromCache ? 'Cached' : 'Synced'}
                           </span>
                         ) : syncState === 'failed' ? (
                           <button

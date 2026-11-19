@@ -3,6 +3,7 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInAnonymously,
   signOut,
   onAuthStateChanged,
   User,
@@ -19,7 +20,6 @@ import {
   getDoc,
   getDocs,
   getDocFromServer,
-  addDoc,
   setDoc,
   updateDoc,
   deleteDoc,
@@ -30,6 +30,7 @@ import {
   onSnapshot,
   writeBatch,
   serverTimestamp,
+  waitForPendingWrites,
   Timestamp,
   Unsubscribe,
   Query,
@@ -106,11 +107,11 @@ export interface FirestoreErrorInfo {
   };
 }
 
-export function handleFirestoreError(
+export function buildFirestoreErrorInfo(
   error: unknown,
   operationType: OperationType,
   path: string | null
-): never {
+): FirestoreErrorInfo {
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -131,6 +132,15 @@ export function handleFirestoreError(
     path,
   };
   console.error('Firestore Error:', JSON.stringify(errInfo));
+  return errInfo;
+}
+
+export function handleFirestoreError(
+  error: unknown,
+  operationType: OperationType,
+  path: string | null
+): never {
+  const errInfo = buildFirestoreErrorInfo(error, operationType, path);
   throw new Error(JSON.stringify(errInfo));
 }
 
@@ -149,10 +159,11 @@ export async function testConnection(): Promise<{ online: boolean; message: stri
 }
 
 // ==========================================
-// SHARED DEVICE TERMINAL MODE (NO GOOGLE LOGIN REQUIRED)
+// SHARED DEVICE TERMINAL MODE & SAFE AUTH (NO GOOGLE LOGIN REQUIRED)
 // ==========================================
 const STORAGE_KEY_DEVICE_ID = 'qr_bus_device_operator_id_v1';
 let cachedDeviceId: string | null = null;
+let anonymousAuthAttempted = false;
 
 export function getDeviceOperatorId(): string {
   if (cachedDeviceId) return cachedDeviceId;
@@ -176,6 +187,74 @@ export function getDeviceOperatorId(): string {
   }
   cachedDeviceId = 'SHARED_TERMINAL';
   return cachedDeviceId;
+}
+
+export async function ensureOptionalAnonymousAuth(): Promise<string | null> {
+  if (auth.currentUser?.uid) return auth.currentUser.uid;
+  if (anonymousAuthAttempted) return auth.currentUser?.uid ?? null;
+  anonymousAuthAttempted = true;
+  try {
+    const cred = await signInAnonymously(auth);
+    return cred.user.uid;
+  } catch {
+    // Graceful fallback when Anonymous Auth is disabled in Firebase Console (auth/admin-restricted-operation)
+    return null;
+  }
+}
+
+export async function registerDeviceTerminal(
+  role: 'Admin' | 'Staff' | 'Viewer' = 'Staff'
+): Promise<{ deviceId: string; authUid: string | null }> {
+  const deviceId = getDeviceOperatorId();
+  const authUid = await ensureOptionalAnonymousAuth();
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return { deviceId, authUid };
+  }
+
+  const docRef = doc(db, 'devices', deviceId);
+  const platform =
+    typeof navigator !== 'undefined'
+      ? clampString(navigator.platform || 'Web', 100) || 'Web'
+      : 'Web';
+  const userAgent =
+    typeof navigator !== 'undefined'
+      ? clampString(navigator.userAgent || 'Browser', 250) || 'Browser'
+      : 'Browser';
+
+  try {
+    const snap = await getDoc(docRef);
+    if (snap.exists()) {
+      await updateDoc(docRef, {
+        role,
+        platform,
+        user_agent: userAgent,
+        auth_uid: authUid || null,
+        status: 'online',
+        last_seen: Date.now(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await setDoc(docRef, {
+        device_id: deviceId,
+        role,
+        platform,
+        user_agent: userAgent,
+        auth_uid: authUid || null,
+        status: 'online',
+        last_seen: Date.now(),
+        ownerId: deviceId,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    // Non-fatal if offline during startup
+    if (!isBrowserOfflineError(err)) {
+      buildFirestoreErrorInfo(err, OperationType.WRITE, `devices/${deviceId}`);
+    }
+  }
+
+  return { deviceId, authUid };
 }
 
 export function isBootstrappedAdminEmail(email?: string | null): boolean {
@@ -268,7 +347,7 @@ function buildSharedCollectionQuery(collectionName: string, limitOverride?: numb
 // ==========================================
 // DATA MAPPERS & PAYLOAD BUILDERS
 // ==========================================
-function mapStudentDoc(data: DocumentData): Student {
+function mapStudentDoc(data: DocumentData, fromCache = false, hasPendingWrites = false): Student {
   const studentId = String(data.student_id || '').trim();
   const qrCode = String(data.qr_code || studentId).trim();
   const grade = String(data.grade || 'แผนกทั่วไป');
@@ -339,6 +418,8 @@ function mapStudentDoc(data: DocumentData): Student {
     ownerId: data.ownerId ? String(data.ownerId) : undefined,
     created_at: formatTimestampField(data.createdAt),
     updated_at: formatTimestampField(data.updatedAt),
+    fromCache,
+    hasPendingWrites,
   };
 }
 
@@ -408,7 +489,7 @@ function buildStudentPayload(student: Student, ownerId: string, isCreate: boolea
   return payload;
 }
 
-function mapCarDoc(data: DocumentData): Car {
+function mapCarDoc(data: DocumentData, fromCache = false, hasPendingWrites = false): Car {
   return {
     carID: String(data.car_id || ''),
     plate: String(data.plate_number || ''),
@@ -421,6 +502,9 @@ function mapCarDoc(data: DocumentData): Car {
     capacity: Number(data.capacity || 60),
     status: String(data.status || 'ใช้งาน'),
     ownerId: data.ownerId ? String(data.ownerId) : undefined,
+    updated_at: formatTimestampField(data.updatedAt),
+    fromCache,
+    hasPendingWrites,
   };
 }
 
@@ -461,7 +545,8 @@ function normalizeScanSourceValue(raw: unknown): ScanRecord['scanSource'] {
 function mapScanDoc(
   data: DocumentData,
   docId?: string,
-  hasPendingWrites = false
+  hasPendingWrites = false,
+  fromCache = false
 ): ScanRecord {
   const scanDate = String(data.scan_date || '');
   const scanTime = String(data.scan_time || '');
@@ -474,7 +559,7 @@ function mapScanDoc(
 
   return {
     id: scanId,
-    firestoreDocId: docId,
+    firestoreDocId: docId || scanId,
     scanId,
     timestamp,
     dateThai: String(data.dateThai || scanDate),
@@ -493,7 +578,7 @@ function mapScanDoc(
     latitude: typeof data.latitude === 'number' ? data.latitude : 13.7548,
     longitude: typeof data.longitude === 'number' ? data.longitude : 100.4982,
     scanSource: normalizeScanSourceValue(data.scan_source),
-    scanResult: String(data.scan_result || 'สำเร็จ'),
+    scanResult: String(data.scan_result || (hasPendingWrites ? 'รอซิงค์เซิร์ฟเวอร์' : 'สำเร็จ')),
     status: 'success',
     scanType: String(data.scan_type || 'ขึ้นรถ'),
     scannerName: String(data.scanner_by || 'เจ้าหน้าที่'),
@@ -502,6 +587,8 @@ function mapScanDoc(
     avatar: data.avatar ? String(data.avatar) : undefined,
     dbSaved: !hasPendingWrites,
     syncStatus: hasPendingWrites ? 'pending' : 'synced',
+    fromCache,
+    hasPendingWrites,
     ownerId: data.ownerId ? String(data.ownerId) : undefined,
   };
 }
@@ -518,15 +605,20 @@ function buildScanPayload(scan: ScanRecord, ownerId: string, isCreate: boolean):
 
   const scanType = scan.scanType === 'ลงรถ' ? 'ลงรถ' : 'ขึ้นรถ';
   const scanSource = normalizeScanSourceValue(scan.scanSource);
+  const studentIdStr = clampString(scan.studentCode || scan.studentId || 'UNKNOWN', 128) || 'UNKNOWN';
+  const safeAvatar =
+    scan.avatar && !(scan.avatar.startsWith('data:') && scan.avatar.length > 500)
+      ? clampNullableString(scan.avatar, 500)
+      : `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(studentIdStr)}`;
 
   const payload: Record<string, unknown> = {
     scan_id: scanId,
     timestamp: ts,
-    scan_date: clampString(scanDate, 30),
+    scan_date: clampString(scanDate, 30) || scanDate,
     dateThai: clampNullableString(scan.dateThai || scanDate, 50),
-    scan_time: clampString(scanTime, 30),
+    scan_time: clampString(scanTime, 30) || scanTime,
     timeThai: clampNullableString(scan.timeThai || scan.time || `${scanTime} น.`, 50),
-    student_id: clampString(scan.studentCode || scan.studentId || '', 128),
+    student_id: studentIdStr,
     student_name: clampString(scan.name || 'พนักงาน', 200) || 'พนักงาน',
     grade: clampNullableString(scan.grade || 'แผนกทั่วไป', 100),
     room: clampNullableString(scan.room || '', 50),
@@ -542,7 +634,7 @@ function buildScanPayload(scan: ScanRecord, ownerId: string, isCreate: boolean):
     note: clampNullableString(scan.note || '', 500),
     latitude: toValidNumber(scan.latitude, 13.7548),
     longitude: toValidNumber(scan.longitude, 100.4982),
-    avatar: clampNullableString(scan.avatar, 500),
+    avatar: safeAvatar,
     ownerId,
     updatedAt: serverTimestamp(),
   };
@@ -554,7 +646,7 @@ function buildScanPayload(scan: ScanRecord, ownerId: string, isCreate: boolean):
   return payload;
 }
 
-function mapAppUserDoc(data: DocumentData): AppUser {
+function mapAppUserDoc(data: DocumentData, fromCache = false, hasPendingWrites = false): AppUser {
   const role =
     data.role === 'Admin' || data.role === 'Staff' || data.role === 'Viewer'
       ? data.role
@@ -567,6 +659,9 @@ function mapAppUserDoc(data: DocumentData): AppUser {
     car_id: String(data.car_id || 'ALL'),
     status: String(data.status || 'ใช้งาน'),
     ownerId: data.ownerId ? String(data.ownerId) : undefined,
+    updated_at: formatTimestampField(data.updatedAt),
+    fromCache,
+    hasPendingWrites,
   };
 }
 
@@ -597,12 +692,15 @@ function buildAppUserPayload(appUser: AppUser, ownerId: string, isCreate: boolea
   return payload;
 }
 
-function mapSettingDoc(data: DocumentData): SystemSetting {
+function mapSettingDoc(data: DocumentData, fromCache = false, hasPendingWrites = false): SystemSetting {
   return {
     key: String(data.key || ''),
     value: String(data.value || ''),
     description: String(data.description || ''),
     ownerId: data.ownerId ? String(data.ownerId) : undefined,
+    updated_at: formatTimestampField(data.updatedAt),
+    fromCache,
+    hasPendingWrites,
   };
 }
 
@@ -643,18 +741,53 @@ export async function fetchStudentsFromFirebase(): Promise<{
 }
 
 export async function findStudentInFirestoreByCode(rawCode: string): Promise<Student | null> {
-  const trimmed = (rawCode || '').trim();
+  let trimmed = (rawCode || '').trim();
   if (!trimmed) return null;
   try {
-    const cleanId = sanitizeFirestoreId(trimmed, 'STD');
-    const byIdSnap = await getDoc(doc(db, 'students', cleanId));
-    if (byIdSnap.exists()) {
-      return mapStudentDoc(byIdSnap.data());
+    if (trimmed.includes('text=')) {
+      try {
+        const url = new URL(trimmed);
+        trimmed = (url.searchParams.get('text') || trimmed).trim();
+      } catch {
+        const m = trimmed.match(/text=([^&]+)/);
+        if (m) trimmed = decodeURIComponent(m[1]).trim();
+      }
     }
+
+    // Extract code when QR payload is JSON (e.g. printed QR card payload)
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const extracted = parsed?.code || parsed?.studentCode || parsed?.studentID || parsed?.student_id;
+        if (extracted) {
+          trimmed = String(extracted).trim();
+        }
+      } catch {
+        // Keep trimmed as-is if not valid JSON
+      }
+    }
+
+    const cleanId = sanitizeFirestoreId(trimmed, 'STD');
+    const candidateIds = Array.from(
+      new Set([
+        cleanId,
+        cleanId.toUpperCase(),
+        ...(/^\d+$/.test(trimmed) ? [`STD${String(parseInt(trimmed, 10)).padStart(4, '0')}`] : []),
+      ])
+    );
+
+    for (const candidateId of candidateIds) {
+      const byIdSnap = await getDoc(doc(db, 'students', candidateId));
+      if (byIdSnap.exists()) {
+        return mapStudentDoc(byIdSnap.data(), byIdSnap.metadata.fromCache, byIdSnap.metadata.hasPendingWrites);
+      }
+    }
+
     const q = query(collection(db, 'students'), where('qr_code', '==', trimmed), limit(1));
     const qSnap = await getDocs(q);
     if (!qSnap.empty) {
-      return mapStudentDoc(qSnap.docs[0].data());
+      const firstDoc = qSnap.docs[0];
+      return mapStudentDoc(firstDoc.data(), firstDoc.metadata.fromCache, firstDoc.metadata.hasPendingWrites);
     }
     return null;
   } catch {
@@ -663,8 +796,9 @@ export async function findStudentInFirestoreByCode(rawCode: string): Promise<Stu
 }
 
 export async function upsertStudentToFirebase(
-  student: Student
-): Promise<{ success: boolean; error?: string; data?: Student }> {
+  student: Student,
+  options?: { forceOverwrite?: boolean }
+): Promise<{ success: boolean; error?: string; data?: Student; conflict?: boolean }> {
   const operatorId = getDeviceOperatorId();
   const studentId = sanitizeFirestoreId(
     student.student_id || student.studentId || student.id || student.studentCode || '',
@@ -683,16 +817,37 @@ export async function upsertStudentToFirebase(
 
     if (existingSnap.exists()) {
       const existingData = existingSnap.data();
+      const serverUpdatedAt = formatTimestampField(existingData.updatedAt);
+      if (
+        !options?.forceOverwrite &&
+        student.updated_at &&
+        serverUpdatedAt &&
+        student.updated_at !== serverUpdatedAt &&
+        new Date(serverUpdatedAt).getTime() > new Date(student.updated_at).getTime()
+      ) {
+        return {
+          success: false,
+          conflict: true,
+          error: 'ข้อมูลพนักงานถูกแก้ไขจากอุปกรณ์อื่นล่าสุด กรุณาตรวจสอบข้อมูลใหม่',
+          data: mapStudentDoc(existingData, existingSnap.metadata.fromCache, existingSnap.metadata.hasPendingWrites),
+        };
+      }
       const ownerId = String(existingData.ownerId || operatorId);
       const payload = buildStudentPayload({ ...student, id: studentId, student_id: studentId }, ownerId, false);
       delete payload.ownerId;
       delete payload.student_id;
       await updateDoc(docRef, payload);
-      return { success: true, data: { ...student, id: studentId, student_id: studentId } };
+      return {
+        success: true,
+        data: { ...student, id: studentId, student_id: studentId, updated_at: new Date().toISOString() },
+      };
     } else {
       const payload = buildStudentPayload({ ...student, id: studentId, student_id: studentId }, operatorId, true);
       await setDoc(docRef, payload);
-      return { success: true, data: { ...student, id: studentId, student_id: studentId } };
+      return {
+        success: true,
+        data: { ...student, id: studentId, student_id: studentId, updated_at: new Date().toISOString() },
+      };
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
@@ -723,7 +878,9 @@ export async function fetchCarsFromFirebase(): Promise<{
   try {
     const q = buildSharedCollectionQuery('cars');
     const snapshot = await getDocs(q);
-    const list = snapshot.docs.map((d) => mapCarDoc(d.data()));
+    const list = snapshot.docs.map((d) =>
+      mapCarDoc(d.data(), snapshot.metadata.fromCache, d.metadata.hasPendingWrites)
+    );
     list.sort((a, b) => a.carID.localeCompare(b.carID));
     return { success: true, data: list };
   } catch (err) {
@@ -766,8 +923,9 @@ export async function ensureCarExistsInFirebase(
 }
 
 export async function upsertCarToFirebase(
-  car: Car
-): Promise<{ success: boolean; error?: string; data?: Car }> {
+  car: Car,
+  options?: { forceOverwrite?: boolean }
+): Promise<{ success: boolean; error?: string; data?: Car; conflict?: boolean }> {
   const operatorId = getDeviceOperatorId();
   const carId = sanitizeFirestoreId(car.carID, 'CAR');
   const path = `cars/${carId}`;
@@ -776,16 +934,32 @@ export async function upsertCarToFirebase(
     const existingSnap = await getDoc(docRef);
 
     if (existingSnap.exists()) {
-      const ownerId = String(existingSnap.data().ownerId || operatorId);
+      const existingData = existingSnap.data();
+      const serverUpdatedAt = formatTimestampField(existingData.updatedAt);
+      if (
+        !options?.forceOverwrite &&
+        car.updated_at &&
+        serverUpdatedAt &&
+        car.updated_at !== serverUpdatedAt &&
+        new Date(serverUpdatedAt).getTime() > new Date(car.updated_at).getTime()
+      ) {
+        return {
+          success: false,
+          conflict: true,
+          error: 'ข้อมูลรถถูกแก้ไขจากอุปกรณ์อื่นล่าสุด กรุณาตรวจสอบข้อมูลใหม่',
+          data: mapCarDoc(existingData, existingSnap.metadata.fromCache, existingSnap.metadata.hasPendingWrites),
+        };
+      }
+      const ownerId = String(existingData.ownerId || operatorId);
       const payload = buildCarPayload({ ...car, carID: carId }, ownerId, false);
       delete payload.ownerId;
       delete payload.car_id;
       await updateDoc(docRef, payload);
-      return { success: true, data: { ...car, carID: carId } };
+      return { success: true, data: { ...car, carID: carId, updated_at: new Date().toISOString() } };
     } else {
       const payload = buildCarPayload({ ...car, carID: carId }, operatorId, true);
       await setDoc(docRef, payload);
-      return { success: true, data: { ...car, carID: carId } };
+      return { success: true, data: { ...car, carID: carId, updated_at: new Date().toISOString() } };
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
@@ -1109,46 +1283,98 @@ export async function insertScanToFirebase(
     skipStudentUpsert?: boolean;
     checkDuplicateBeforeAdd?: boolean;
   }
-): Promise<{ success: boolean; docId?: string; error?: string; isOfflineQueued?: boolean }> {
+): Promise<{
+  success: boolean;
+  docId?: string;
+  error?: string;
+  isOfflineQueued?: boolean;
+  confirmedServer?: boolean;
+}> {
   const operatorId = getDeviceOperatorId();
   const scanId = sanitizeFirestoreId(scan.scanId || scan.id || '', 'SCN');
-  const path = `scans/${scanId}`;
+  const targetDocId = sanitizeFirestoreId(scan.firestoreDocId || scanId, 'SCN');
+  const path = `scans/${targetDocId}`;
 
-  // When browser is known offline, store ONLY in local pending queue without calling addDoc
-  // so IndexedDB persistent cache never duplicates writes with localStorage sync queue.
+  // Always persist to local recovery queue first if offline
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     if (!options?.skipQueue) {
       savePendingScan({
         ...scan,
+        id: scanId,
         scanId,
+        firestoreDocId: targetDocId,
         dbSaved: false,
         syncStatus: 'pending',
       });
     }
-    return { success: false, isOfflineQueued: true };
+    return { success: false, docId: targetDocId, isOfflineQueued: true, confirmedServer: false };
   }
 
   if (inFlightScanIds.has(scanId)) {
     return { success: false, error: 'กำลังบันทึกข้อมูลรายการนี้อยู่' };
   }
 
+  // Pre-queue durably before write so reload/network drop never loses a scanned card
+  if (!options?.skipQueue) {
+    savePendingScan({
+      ...scan,
+      id: scanId,
+      scanId,
+      firestoreDocId: targetDocId,
+      dbSaved: false,
+      syncStatus: 'pending',
+    });
+  }
+
   inFlightScanIds.add(scanId);
   try {
-    // Deduplicate when syncing from offline queue or retrying
+    const docRef = doc(db, 'scans', targetDocId);
+
+    // Deterministic ID deduplication check when syncing from offline queue or retrying
     if (options?.checkDuplicateBeforeAdd) {
+      const existingByDoc = await getDoc(docRef).catch(() => null);
+      if (existingByDoc?.exists()) {
+        removePendingScan(scan.scanId || scan.id);
+        removePendingScan(scanId);
+        return { success: true, docId: existingByDoc.id, confirmedServer: !existingByDoc.metadata.hasPendingWrites };
+      }
       const dupQuery = query(collection(db, 'scans'), where('scan_id', '==', scanId), limit(1));
       const dupSnap = await getDocs(dupQuery);
       if (!dupSnap.empty) {
-        const existingDocId = dupSnap.docs[0].id;
+        const existingDoc = dupSnap.docs[0];
         removePendingScan(scan.scanId || scan.id);
         removePendingScan(scanId);
-        return { success: true, docId: existingDocId };
+        return { success: true, docId: existingDoc.id, confirmedServer: !existingDoc.metadata.hasPendingWrites };
       }
     }
 
-    let docId = scan.firestoreDocId;
+    const writePromise = (async () => {
+      if (options?.isNewScan === false && scan.firestoreDocId) {
+        const existingSnap = await getDoc(docRef);
+        if (existingSnap.exists()) {
+          const ownerId = String(existingSnap.data().ownerId || operatorId);
+          const payload = buildScanPayload(
+            {
+              ...scan,
+              id: scanId,
+              scanId,
+              device: scan.device || operatorId,
+              scannerName: scan.scannerName || operatorId,
+              scanResult: scan.scanResult || 'สำเร็จ',
+            },
+            ownerId,
+            false
+          );
+          delete payload.ownerId;
+          delete payload.scan_id;
+          await updateDoc(docRef, payload);
+          return targetDocId;
+        }
+      }
 
-    if (options?.isNewScan !== false) {
+      // Deterministic Document ID write via setDoc(doc(db, 'scans', scanId), payload)
+      // Ensures zero duplicates on retries, offline flushes, or concurrent callbacks
+      const deterministicRef = doc(db, 'scans', scanId);
       const payload = buildScanPayload(
         {
           ...scan,
@@ -1161,50 +1387,36 @@ export async function insertScanToFirebase(
         operatorId,
         true
       );
-      const docRef = await addDoc(collection(db, 'scans'), payload);
-      docId = docRef.id;
-    } else if (docId) {
-      const docRef = doc(db, 'scans', docId);
-      const existingSnap = await getDoc(docRef);
-      if (existingSnap.exists()) {
-        const ownerId = String(existingSnap.data().ownerId || operatorId);
-        const payload = buildScanPayload(
-          {
-            ...scan,
-            id: scanId,
-            scanId,
-            device: scan.device || operatorId,
-            scannerName: scan.scannerName || operatorId,
-          },
-          ownerId,
-          false
-        );
-        delete payload.ownerId;
-        delete payload.scan_id;
-        await updateDoc(docRef, payload);
-      } else {
-        const payload = buildScanPayload(
-          { ...scan, id: scanId, scanId, device: scan.device || operatorId },
-          operatorId,
-          true
-        );
-        const createdRef = await addDoc(collection(db, 'scans'), payload);
-        docId = createdRef.id;
-      }
-    } else {
-      const payload = buildScanPayload(
-        { ...scan, id: scanId, scanId, device: scan.device || operatorId },
-        operatorId,
-        true
-      );
-      const createdRef = await addDoc(collection(db, 'scans'), payload);
-      docId = createdRef.id;
+      await setDoc(deterministicRef, payload);
+      return scanId;
+    })();
+
+    // Race write + server pending flush against a 5s network stall guard so UI never freezes
+    const TIMEOUT_SENTINEL = '__FIRESTORE_WRITE_PENDING_TIMEOUT__';
+    const writeResult = await Promise.race([
+      writePromise.then(async (writtenId) => {
+        await waitForPendingWrites(db).catch(() => {});
+        return writtenId;
+      }),
+      new Promise<string>((resolve) => window.setTimeout(() => resolve(TIMEOUT_SENTINEL), 5000)),
+    ]);
+
+    if (writeResult === TIMEOUT_SENTINEL) {
+      // Write has been accepted into Firestore persistentLocalCache and localStorage queue;
+      // server confirmation will arrive via onSnapshot metadata (hasPendingWrites -> false)
+      return {
+        success: true,
+        docId: scanId,
+        isOfflineQueued: true,
+        confirmedServer: false,
+      };
     }
 
+    const finalDocId = writeResult;
     removePendingScan(scan.scanId || scan.id);
     removePendingScan(scanId);
 
-    // Ensure unknown student / missing car in background after confirmed scan save
+    // Ensure unknown student / missing car in background after scan write
     if (!options?.skipStudentUpsert) {
       const studentId = sanitizeFirestoreId(scan.studentCode || scan.studentId || '', 'STD');
       const carId = clampString(scan.carID || scan.busNumber || 'CAR01', 128);
@@ -1231,13 +1443,15 @@ export async function insertScanToFirebase(
       });
     }
 
-    return { success: true, docId };
+    return { success: true, docId: finalDocId, confirmedServer: true };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     if (!options?.skipQueue) {
       savePendingScan({
         ...scan,
+        id: scanId,
         scanId,
+        firestoreDocId: scanId,
         dbSaved: false,
         syncStatus: isBrowserOfflineError(err) ? 'pending' : 'failed',
         syncError: errMsg,
@@ -1311,7 +1525,9 @@ export async function fetchUsersFromFirebase(): Promise<AppUser[]> {
   try {
     const q = buildSharedCollectionQuery('users');
     const snapshot = await getDocs(q);
-    const list = snapshot.docs.map((d) => mapAppUserDoc(d.data()));
+    const list = snapshot.docs.map((d) =>
+      mapAppUserDoc(d.data(), snapshot.metadata.fromCache, d.metadata.hasPendingWrites)
+    );
     list.sort((a, b) => a.user_id.localeCompare(b.user_id));
     return list;
   } catch (err) {
@@ -1327,7 +1543,17 @@ export async function upsertUserToFirebase(appUser: AppUser): Promise<void> {
     const docRef = doc(db, 'users', userId);
     const snap = await getDoc(docRef);
     if (snap.exists()) {
-      const ownerId = String(snap.data().ownerId || operatorId);
+      const existingData = snap.data();
+      const serverUpdatedAt = formatTimestampField(existingData.updatedAt);
+      if (
+        appUser.updated_at &&
+        serverUpdatedAt &&
+        appUser.updated_at !== serverUpdatedAt &&
+        new Date(serverUpdatedAt).getTime() > new Date(appUser.updated_at).getTime()
+      ) {
+        throw new Error('ข้อมูลผู้ใช้ถูกแก้ไขจากอุปกรณ์อื่นล่าสุด กรุณารีเฟรชก่อนบันทึก');
+      }
+      const ownerId = String(existingData.ownerId || operatorId);
       const payload = buildAppUserPayload({ ...appUser, user_id: userId }, ownerId, false);
       delete payload.ownerId;
       delete payload.user_id;
@@ -1354,7 +1580,9 @@ export async function fetchSettingsFromFirebase(): Promise<SystemSetting[]> {
   try {
     const q = buildSharedCollectionQuery('settings');
     const snapshot = await getDocs(q);
-    const list = snapshot.docs.map((d) => mapSettingDoc(d.data()));
+    const list = snapshot.docs.map((d) =>
+      mapSettingDoc(d.data(), snapshot.metadata.fromCache, d.metadata.hasPendingWrites)
+    );
     list.sort((a, b) => a.key.localeCompare(b.key));
     return list;
   } catch (err) {
@@ -1370,7 +1598,17 @@ export async function upsertSettingToFirebase(setting: SystemSetting): Promise<v
     const docRef = doc(db, 'settings', key);
     const snap = await getDoc(docRef);
     if (snap.exists()) {
-      const ownerId = String(snap.data().ownerId || operatorId);
+      const existingData = snap.data();
+      const serverUpdatedAt = formatTimestampField(existingData.updatedAt);
+      if (
+        setting.updated_at &&
+        serverUpdatedAt &&
+        setting.updated_at !== serverUpdatedAt &&
+        new Date(serverUpdatedAt).getTime() > new Date(setting.updated_at).getTime()
+      ) {
+        throw new Error('การตั้งค่านี้ถูกแก้ไขจากอุปกรณ์อื่นล่าสุด กรุณารีเฟรชก่อนบันทึก');
+      }
+      const ownerId = String(existingData.ownerId || operatorId);
       const payload = buildSettingPayload({ ...setting, key }, ownerId, false);
       delete payload.ownerId;
       delete payload.key;
@@ -1396,12 +1634,15 @@ export async function deleteSettingFromFirebase(key: string): Promise<void> {
 // ==========================================
 // 5. REALTIME ONSNAPSHOT SUBSCRIPTIONS
 // ==========================================
+export interface CollectionSnapshotMeta {
+  fromCache: boolean;
+  hasPendingWrites: boolean;
+  docCount: number;
+}
+
 export function subscribeToScansRealtime(
   scansLimit: number,
-  onScans: (
-    scans: ScanRecord[],
-    meta: { fromCache: boolean; hasPendingWrites: boolean; docCount: number }
-  ) => void,
+  onScans: (scans: ScanRecord[], meta: CollectionSnapshotMeta) => void,
   onError?: (err: unknown) => void
 ): Unsubscribe {
   const qScans = buildSharedCollectionQuery('scans', scansLimit);
@@ -1410,7 +1651,7 @@ export function subscribeToScansRealtime(
     { includeMetadataChanges: true },
     (snap) => {
       const rows = snap.docs.map((d) =>
-        mapScanDoc(d.data(), d.id, d.metadata.hasPendingWrites)
+        mapScanDoc(d.data(), d.id, d.metadata.hasPendingWrites, snap.metadata.fromCache)
       );
       rows.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
       onScans(rows, {
@@ -1420,55 +1661,141 @@ export function subscribeToScansRealtime(
       });
     },
     (err) => {
-      onError?.(err);
-      handleFirestoreError(err, OperationType.GET, 'scans');
+      const info = buildFirestoreErrorInfo(err, OperationType.LIST, 'scans');
+      onError?.(new Error(JSON.stringify(info)));
+    }
+  );
+}
+
+export function subscribeToStudentsRealtime(
+  onStudents: (students: Student[], meta: CollectionSnapshotMeta) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const qStudents = buildSharedCollectionQuery('students');
+  return onSnapshot(
+    qStudents,
+    { includeMetadataChanges: true },
+    (snap) => {
+      const rows = snap.docs.map((d) =>
+        mapStudentDoc(d.data(), snap.metadata.fromCache, d.metadata.hasPendingWrites)
+      );
+      rows.sort((a, b) => a.id.localeCompare(b.id));
+      onStudents(rows, {
+        fromCache: snap.metadata.fromCache,
+        hasPendingWrites: snap.metadata.hasPendingWrites,
+        docCount: snap.docs.length,
+      });
+    },
+    (err) => {
+      const info = buildFirestoreErrorInfo(err, OperationType.LIST, 'students');
+      onError?.(new Error(JSON.stringify(info)));
+    }
+  );
+}
+
+export function subscribeToCarsRealtime(
+  onCars: (cars: Car[], meta: CollectionSnapshotMeta) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const qCars = buildSharedCollectionQuery('cars');
+  return onSnapshot(
+    qCars,
+    { includeMetadataChanges: true },
+    (snap) => {
+      const rows = snap.docs.map((d) =>
+        mapCarDoc(d.data(), snap.metadata.fromCache, d.metadata.hasPendingWrites)
+      );
+      rows.sort((a, b) => a.carID.localeCompare(b.carID));
+      onCars(rows, {
+        fromCache: snap.metadata.fromCache,
+        hasPendingWrites: snap.metadata.hasPendingWrites,
+        docCount: snap.docs.length,
+      });
+    },
+    (err) => {
+      const info = buildFirestoreErrorInfo(err, OperationType.LIST, 'cars');
+      onError?.(new Error(JSON.stringify(info)));
+    }
+  );
+}
+
+export function subscribeToUsersRealtime(
+  onUsers: (users: AppUser[], meta: CollectionSnapshotMeta) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const qUsers = buildSharedCollectionQuery('users');
+  return onSnapshot(
+    qUsers,
+    { includeMetadataChanges: true },
+    (snap) => {
+      const rows = snap.docs.map((d) =>
+        mapAppUserDoc(d.data(), snap.metadata.fromCache, d.metadata.hasPendingWrites)
+      );
+      rows.sort((a, b) => a.user_id.localeCompare(b.user_id));
+      onUsers(rows, {
+        fromCache: snap.metadata.fromCache,
+        hasPendingWrites: snap.metadata.hasPendingWrites,
+        docCount: snap.docs.length,
+      });
+    },
+    (err) => {
+      const info = buildFirestoreErrorInfo(err, OperationType.LIST, 'users');
+      onError?.(new Error(JSON.stringify(info)));
+    }
+  );
+}
+
+export function subscribeToSettingsRealtime(
+  onSettings: (settings: SystemSetting[], meta: CollectionSnapshotMeta) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const qSettings = buildSharedCollectionQuery('settings');
+  return onSnapshot(
+    qSettings,
+    { includeMetadataChanges: true },
+    (snap) => {
+      const rows = snap.docs.map((d) =>
+        mapSettingDoc(d.data(), snap.metadata.fromCache, d.metadata.hasPendingWrites)
+      );
+      rows.sort((a, b) => a.key.localeCompare(b.key));
+      onSettings(rows, {
+        fromCache: snap.metadata.fromCache,
+        hasPendingWrites: snap.metadata.hasPendingWrites,
+        docCount: snap.docs.length,
+      });
+    },
+    (err) => {
+      const info = buildFirestoreErrorInfo(err, OperationType.LIST, 'settings');
+      onError?.(new Error(JSON.stringify(info)));
     }
   );
 }
 
 export function subscribeToFirebaseRealtime(handlers: {
-  onStudents?: (students: Student[]) => void;
-  onCars?: (cars: Car[]) => void;
-  onScans?: (scans: ScanRecord[]) => void;
-  onUsers?: (users: AppUser[]) => void;
-  onSettings?: (settings: SystemSetting[]) => void;
+  onStudents?: (students: Student[], meta?: CollectionSnapshotMeta) => void;
+  onCars?: (cars: Car[], meta?: CollectionSnapshotMeta) => void;
+  onScans?: (scans: ScanRecord[], meta?: CollectionSnapshotMeta) => void;
+  onUsers?: (users: AppUser[], meta?: CollectionSnapshotMeta) => void;
+  onSettings?: (settings: SystemSetting[], meta?: CollectionSnapshotMeta) => void;
   onError?: (err: unknown, collectionName: string) => void;
   scansLimit?: number;
 }): () => void {
   const unsubs: Unsubscribe[] = [];
 
   if (handlers.onStudents) {
-    const qStudents = buildSharedCollectionQuery('students');
     unsubs.push(
-      onSnapshot(
-        qStudents,
-        (snap) => {
-          const rows = snap.docs.map((d) => mapStudentDoc(d.data()));
-          rows.sort((a, b) => a.id.localeCompare(b.id));
-          handlers.onStudents?.(rows);
-        },
-        (err) => {
-          handlers.onError?.(err, 'students');
-          handleFirestoreError(err, OperationType.GET, 'students');
-        }
+      subscribeToStudentsRealtime(
+        (rows, meta) => handlers.onStudents?.(rows, meta),
+        (err) => handlers.onError?.(err, 'students')
       )
     );
   }
 
   if (handlers.onCars) {
-    const qCars = buildSharedCollectionQuery('cars');
     unsubs.push(
-      onSnapshot(
-        qCars,
-        (snap) => {
-          const rows = snap.docs.map((d) => mapCarDoc(d.data()));
-          rows.sort((a, b) => a.carID.localeCompare(b.carID));
-          handlers.onCars?.(rows);
-        },
-        (err) => {
-          handlers.onError?.(err, 'cars');
-          handleFirestoreError(err, OperationType.GET, 'cars');
-        }
+      subscribeToCarsRealtime(
+        (rows, meta) => handlers.onCars?.(rows, meta),
+        (err) => handlers.onError?.(err, 'cars')
       )
     );
   }
@@ -1477,44 +1804,26 @@ export function subscribeToFirebaseRealtime(handlers: {
     unsubs.push(
       subscribeToScansRealtime(
         handlers.scansLimit ?? 50,
-        (rows) => handlers.onScans?.(rows),
+        (rows, meta) => handlers.onScans?.(rows, meta),
         (err) => handlers.onError?.(err, 'scans')
       )
     );
   }
 
   if (handlers.onUsers) {
-    const qUsers = buildSharedCollectionQuery('users');
     unsubs.push(
-      onSnapshot(
-        qUsers,
-        (snap) => {
-          const rows = snap.docs.map((d) => mapAppUserDoc(d.data()));
-          rows.sort((a, b) => a.user_id.localeCompare(b.user_id));
-          handlers.onUsers?.(rows);
-        },
-        (err) => {
-          handlers.onError?.(err, 'users');
-          handleFirestoreError(err, OperationType.GET, 'users');
-        }
+      subscribeToUsersRealtime(
+        (rows, meta) => handlers.onUsers?.(rows, meta),
+        (err) => handlers.onError?.(err, 'users')
       )
     );
   }
 
   if (handlers.onSettings) {
-    const qSettings = buildSharedCollectionQuery('settings');
     unsubs.push(
-      onSnapshot(
-        qSettings,
-        (snap) => {
-          const rows = snap.docs.map((d) => mapSettingDoc(d.data()));
-          rows.sort((a, b) => a.key.localeCompare(b.key));
-          handlers.onSettings?.(rows);
-        },
-        (err) => {
-          handlers.onError?.(err, 'settings');
-          handleFirestoreError(err, OperationType.GET, 'settings');
-        }
+      subscribeToSettingsRealtime(
+        (rows, meta) => handlers.onSettings?.(rows, meta),
+        (err) => handlers.onError?.(err, 'settings')
       )
     );
   }

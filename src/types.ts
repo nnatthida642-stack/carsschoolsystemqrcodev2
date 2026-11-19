@@ -46,6 +46,8 @@ export interface Student {
   created_at?: string;
   updated_at?: string;
   createdDate?: string;
+  fromCache?: boolean;
+  hasPendingWrites?: boolean;
 }
 
 export interface Car {
@@ -60,6 +62,9 @@ export interface Car {
   capacity: number;
   status: string;
   ownerId?: string;
+  updated_at?: string;
+  fromCache?: boolean;
+  hasPendingWrites?: boolean;
 }
 
 export interface ScanRecord {
@@ -93,6 +98,8 @@ export interface ScanRecord {
   dbSaved?: boolean;
   syncStatus?: 'pending' | 'synced' | 'failed';
   syncError?: string;
+  fromCache?: boolean;
+  hasPendingWrites?: boolean;
   ownerId?: string;
 }
 
@@ -104,6 +111,9 @@ export interface AppUser {
   car_id: string;
   status: string;
   ownerId?: string;
+  updated_at?: string;
+  fromCache?: boolean;
+  hasPendingWrites?: boolean;
 }
 
 export interface SystemSetting {
@@ -111,6 +121,32 @@ export interface SystemSetting {
   value: string;
   description: string;
   ownerId?: string;
+  updated_at?: string;
+  fromCache?: boolean;
+  hasPendingWrites?: boolean;
+}
+
+export type SyncConnectionStatus = 'connected' | 'syncing' | 'offline' | 'error' | 'pending';
+
+export interface RealtimeSyncSnapshot {
+  status: SyncConnectionStatus;
+  isOnline: boolean;
+  isFirebaseConnected: boolean;
+  isInitialLoading: boolean;
+  studentsLoaded: boolean;
+  carsLoaded: boolean;
+  scansLoaded: boolean;
+  usersLoaded: boolean;
+  settingsLoaded: boolean;
+  fromCache: boolean;
+  hasPendingWrites: boolean;
+  pendingWritesCount: number;
+  lastSyncedAt: number | null;
+  lastError: string | null;
+  deviceId: string;
+  deviceRole: 'Admin' | 'Staff' | 'Viewer';
+  authUid: string | null;
+  activeListeners: number;
 }
 
 export type AdminTab =

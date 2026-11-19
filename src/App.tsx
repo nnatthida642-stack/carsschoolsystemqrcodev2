@@ -12,7 +12,7 @@ import { formatThaiDateTime } from './data/mockData';
 import { speakFastSuccess, triggerVibration } from './utils/audio';
 import { getInstantCoordinates, warmUpCoordinates } from './utils/geo';
 import { normalizeScannedPayload } from './utils/barcode';
-import { Student, ScanRecord, Car, AdminTab, AppUser, SystemSetting } from './types';
+import { Student, ScanRecord, Car, AdminTab, AppUser, SystemSetting, RealtimeSyncSnapshot } from './types';
 import {
   DEFAULT_APPS_SCRIPT_URL,
   syncToAppsScriptWebhook,
@@ -23,14 +23,8 @@ import {
 } from './services/googleSheets';
 import { getAccessToken } from './services/googleAuth';
 import {
-  testConnection,
   getDeviceOperatorId,
   isFirebaseReady,
-  fetchStudentsFromFirebase,
-  fetchCarsFromFirebase,
-  fetchScansFromFirebase,
-  fetchUsersFromFirebase,
-  fetchSettingsFromFirebase,
   findStudentInFirestoreByCode,
   upsertStudentToFirebase,
   deleteStudentFromFirebase,
@@ -44,8 +38,6 @@ import {
   upsertSettingToFirebase,
   deleteSettingFromFirebase,
   importStudentsBatchToFirebase,
-  subscribeToFirebaseRealtime,
-  subscribeToScansRealtime,
   syncPendingScans,
   getPendingScans,
   removePendingScan,
@@ -54,15 +46,25 @@ import {
   getPendingCars,
   savePendingCar,
   removePendingCar,
-  mergeCarsWithPending,
   syncPendingCars,
   getPendingStudents,
   savePendingStudent,
   removePendingStudent,
-  mergeStudentsWithPending,
   syncPendingStudents,
-  ensureDatabaseSeededIfEmpty,
 } from './services/firebaseClient';
+import {
+  forceResyncAll,
+  getConnectionSnapshot,
+  initGlobalRealtimeSync,
+  notifySyncQueueChanged,
+  setDeviceSessionRole,
+  subscribeCars,
+  subscribeScans,
+  subscribeSettings,
+  subscribeStudents,
+  subscribeSyncStatus,
+  subscribeUsers,
+} from './services/realtimeSync';
 
 function deduplicateAndFixScanIds(records: ScanRecord[]): ScanRecord[] {
   const seenIds = new Set<string>();
@@ -237,10 +239,9 @@ export default function App() {
   const [toastMsg, setToastMsg] = useState<string>('');
 
   // Network & Firebase Cloud Data States (100% Firestore Driven, Shared Multi-Device Without Login)
-  const [isOnline, setIsOnline] = useState<boolean>(() =>
-    typeof navigator !== 'undefined' ? navigator.onLine : true
-  );
-  const [isFirebaseConnected, setIsFirebaseConnected] = useState<boolean>(() => isFirebaseReady());
+  const [syncSnapshot, setSyncSnapshot] = useState<RealtimeSyncSnapshot>(() => getConnectionSnapshot());
+  const isOnline = syncSnapshot.isOnline;
+  const isFirebaseConnected = syncSnapshot.isFirebaseConnected;
   const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
   const [students, setStudents] = useState<Student[]>(() => getPendingStudents());
   const [cars, setCars] = useState<Car[]>(() => getPendingCars());
@@ -249,6 +250,7 @@ export default function App() {
   const [hasMoreScans, setHasMoreScans] = useState<boolean>(false);
   const [isLoadingMoreScans, setIsLoadingMoreScans] = useState<boolean>(false);
   const [isSavingScan, setIsSavingScan] = useState<boolean>(false);
+  const [latestRemoteScanId, setLatestRemoteScanId] = useState<string | null>(null);
   const [users, setUsers] = useState<AppUser[]>([]);
   const [settings, setSettings] = useState<SystemSetting[]>([]);
 
@@ -263,12 +265,15 @@ export default function App() {
   const [isSyncingSheets, setIsSyncingSheets] = useState<boolean>(false);
   const [isSyncingFirebase, setIsSyncingFirebase] = useState<boolean>(false);
 
-  const hasAutoSeededRef = useRef<boolean>(false);
   const recentStudentScanRef = useRef<Map<string, number>>(readPersistedScanLocks(Date.now()));
   const inFlightKeysRef = useRef<Set<string>>(new Set());
   const scansRef = useRef<ScanRecord[]>(scans);
   const studentsRef = useRef<Student[]>(students);
+  const carsRef = useRef<Car[]>(cars);
+  const usersRef = useRef<AppUser[]>(users);
+  const settingsRef = useRef<SystemSetting[]>(settings);
   const seenScanIdsRef = useRef<Set<string>>(new Set());
+  const localCreatedScanIdsRef = useRef<Set<string>>(new Set());
   const hasLoadedInitialScansRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -278,6 +283,18 @@ export default function App() {
   useEffect(() => {
     studentsRef.current = students;
   }, [students]);
+
+  useEffect(() => {
+    carsRef.current = cars;
+  }, [cars]);
+
+  useEffect(() => {
+    usersRef.current = users;
+  }, [users]);
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   // Google Sheets & Apps Script State
   const [appsScriptUrl, setAppsScriptUrl] = useState<string>(() => {
@@ -350,42 +367,26 @@ export default function App() {
   }, []);
 
   // ==========================================
-  // SHARED REALTIME FIRESTORE SYNC (NO LOGIN REQUIRED)
+  // SHARED REALTIME FIRESTORE SYNC (CENTRALIZED SERVICE, NO LOGIN REQUIRED)
   // ==========================================
   const refreshFromFirebase = useCallback(
     async (silent = false) => {
       if (!isFirebaseReady()) return;
       setIsSyncingFirebase(true);
       try {
-        const [stuRes, carRes, scanRes, userList, settingList] = await Promise.all([
-          fetchStudentsFromFirebase(),
-          fetchCarsFromFirebase(),
-          fetchScansFromFirebase(scansLimit),
-          fetchUsersFromFirebase(),
-          fetchSettingsFromFirebase(),
-        ]);
-
-        const summary: string[] = [];
-        if (stuRes.success) {
-          setStudents(mergeStudentsWithPending(stuRes.data));
-          summary.push(`พนักงาน ${stuRes.data.length} คน`);
-        }
-        if (carRes.success) {
-          setCars(mergeCarsWithPending(carRes.data));
-          summary.push(`รถ ${carRes.data.length} คัน`);
-        }
-        if (scanRes.success) {
-          const uniqueScans = deduplicateAndFixScanIds(mergeScansWithPending(scanRes.data));
-          setScans(uniqueScans);
-          setHasMoreScans(scanRes.data.length >= scansLimit);
-          summary.push(`สแกน ${uniqueScans.length} รายการ`);
-        }
-        setUsers(userList);
-        setSettings(settingList);
-        setIsFirebaseConnected(true);
+        const res = await forceResyncAll(scansLimit);
+        setStudents(res.students);
+        setCars(res.cars);
+        const uniqueScans = deduplicateAndFixScanIds(res.scans);
+        setScans(uniqueScans);
+        setHasMoreScans(res.scans.length >= scansLimit);
+        setUsers(res.users);
+        setSettings(res.settings);
 
         if (!silent) {
-          showToast(`🔥 ดึงข้อมูล Firebase 100%: ${summary.join(' • ')}`);
+          showToast(
+            `🔥 ซิงค์ข้อมูลสด Firebase 100%: พนักงาน ${res.students.length} คน • รถ ${res.cars.length} คัน • สแกน ${uniqueScans.length} รายการ`
+          );
         }
       } catch (err) {
         console.warn('Failed to fetch from Firebase:', err);
@@ -399,88 +400,56 @@ export default function App() {
     [scansLimit, showToast]
   );
 
-  // Immediately connect to Firestore, flush pending queues, auto-seed if empty, and subscribe to live cross-device updates
+  // Boot centralized real-time manager & subscribe to students, cars, users, settings, and global status
   useEffect(() => {
     if (!isFirebaseReady()) return;
-    let isCancelled = false;
-    let unsubscribeRealtime: (() => void) | null = null;
 
-    const initSharedCloudSync = async () => {
-      try {
-        const conn = await testConnection();
-        if (!isCancelled) {
-          setIsFirebaseConnected(conn.online);
-        }
-      } catch {
-        // Ignore transient connection check errors
+    const unsubStatus = subscribeSyncStatus((snap) => {
+      setSyncSnapshot(snap);
+    });
+
+    void initGlobalRealtimeSync((step) => {
+      showToast(`🔥 ${step}`);
+    });
+
+    const unsubStudents = subscribeStudents((rows) => {
+      setStudents(rows);
+    });
+
+    const unsubCars = subscribeCars((rows) => {
+      setCars(rows);
+    });
+
+    const unsubUsers = subscribeUsers((rows) => {
+      setUsers(rows);
+    });
+
+    const unsubSettings = subscribeSettings((rows) => {
+      setSettings(rows);
+      const soundRow = rows.find((s) => s.key === 'sound_enabled' || s.key === 'voice_enabled');
+      if (soundRow) {
+        setSoundEnabled(soundRow.value !== 'false' && soundRow.value !== '0');
       }
-
-      // Flush pending offline Cars -> Students -> Scans FIRST so nothing is overwritten
-      try {
-        const carSync = await syncPendingCars();
-        const stuSync = await syncPendingStudents();
-        const scanSync = await syncPendingScans();
-        const totalSynced = carSync.syncedCount + stuSync.syncedCount + scanSync.syncedCount;
-        if (!isCancelled && totalSynced > 0) {
-          showToast(
-            `🔥 ซิงค์ข้อมูลที่ค้างไว้ขึ้น Firebase สำเร็จ (รถ ${carSync.syncedCount}, พนักงาน ${stuSync.syncedCount}, สแกน ${scanSync.syncedCount})`
-          );
-        }
-      } catch {
-        // Will retry when back online
-      }
-
-      // Auto-seed 300 students + 5 cars + 3 users + 10 settings on first run if DB is empty
-      if (!hasAutoSeededRef.current) {
-        hasAutoSeededRef.current = true;
-        try {
-          const seedResult = await ensureDatabaseSeededIfEmpty((p) => {
-            if (!isCancelled) {
-              showToast(`🔥 ${p.step}`);
-            }
-          });
-          if (!isCancelled && seedResult.seeded) {
-            showToast(`🔥 ย้ายรายชื่อพนักงาน ${seedResult.studentsCount} คน & ข้อมูลระบบเข้า Firebase ครบ 100%!`);
-          }
-        } catch (seedErr) {
-          console.warn('Auto-seed check notice:', seedErr);
-        }
-      }
-
-      if (isCancelled) return;
-
-      // Attach real-time Firestore listeners for students, cars, users, settings (without duplicating scans listener)
-      unsubscribeRealtime = subscribeToFirebaseRealtime({
-        onStudents: (rows) => setStudents(mergeStudentsWithPending(rows)),
-        onCars: (rows) => setCars(mergeCarsWithPending(rows)),
-        onUsers: (rows) => setUsers(rows),
-        onSettings: (rows) => setSettings(rows),
-        onError: () => {
-          setIsFirebaseConnected(false);
-        },
-      });
-    };
-
-    void initSharedCloudSync();
+    });
 
     return () => {
-      isCancelled = true;
-      if (unsubscribeRealtime) {
-        unsubscribeRealtime();
-      }
+      unsubStatus();
+      unsubStudents();
+      unsubCars();
+      unsubUsers();
+      unsubSettings();
     };
   }, [showToast]);
 
-  // Dedicated paginated real-time listener for scans collection (clean unsubscribe on limit change / unmount)
+  // Dedicated paginated real-time listener for scans collection via centralized service
   useEffect(() => {
     if (!isFirebaseReady()) return;
 
-    const unsubscribeScans = subscribeToScansRealtime(
+    const unsubscribeScans = subscribeScans(
       scansLimit,
       (rows, meta) => {
         setIsLoadingMoreScans(false);
-        setHasMoreScans(meta.docCount >= scansLimit);
-        setIsFirebaseConnected(true);
+        setHasMoreScans((meta?.docCount ?? rows.length) >= scansLimit);
 
         const merged = deduplicateAndFixScanIds(mergeScansWithPending(rows));
         if (hasLoadedInitialScansRef.current) {
@@ -490,11 +459,17 @@ export default function App() {
             return (
               key &&
               !seenScanIdsRef.current.has(key) &&
+              !localCreatedScanIdsRef.current.has(key) &&
               typeof s.timestamp === 'number' &&
-              nowTs - s.timestamp < 20000
+              Math.abs(nowTs - s.timestamp) < 300000
             );
           });
           if (newRemoteScan) {
+            const highlightKey = newRemoteScan.scanId || newRemoteScan.id;
+            setLatestRemoteScanId(highlightKey);
+            window.setTimeout(() => {
+              setLatestRemoteScanId((curr) => (curr === highlightKey ? null : curr));
+            }, 6000);
             showToast(
               `📡 ซิงค์รายการสแกนเรียลไทม์: ${newRemoteScan.name} (${newRemoteScan.scanType || 'ขึ้นรถ'})`
             );
@@ -511,7 +486,6 @@ export default function App() {
       },
       () => {
         setIsLoadingMoreScans(false);
-        setIsFirebaseConnected(false);
       }
     );
 
@@ -520,42 +494,17 @@ export default function App() {
     };
   }, [scansLimit, showToast]);
 
-  // Track browser Online / Offline state & auto-sync pending queue on reconnect
+  // Notify toast when network status transitions
+  const prevOnlineRef = useRef<boolean>(isOnline);
   useEffect(() => {
-    const handleOnline = async () => {
-      setIsOnline(true);
-      if (isFirebaseReady()) {
-        try {
-          const conn = await testConnection();
-          setIsFirebaseConnected(conn.online);
-          const carRes = await syncPendingCars();
-          const stuRes = await syncPendingStudents();
-          const scanRes = await syncPendingScans();
-          const total = carRes.syncedCount + stuRes.syncedCount + scanRes.syncedCount;
-          if (total > 0) {
-            showToast(`🔥 ออนไลน์: ซิงค์ข้อมูลที่ค้างไว้ขึ้น Firebase สำเร็จ (${total} รายการ)`);
-          } else {
-            showToast('🟢 กลับมาออนไลน์แล้ว — เชื่อมต่อ Firebase Real-time');
-          }
-        } catch {
-          // Ignore transient error
-        }
-      }
-    };
-
-    const handleOffline = () => {
-      setIsOnline(false);
-      setIsFirebaseConnected(false);
+    if (prevOnlineRef.current === isOnline) return;
+    prevOnlineRef.current = isOnline;
+    if (isOnline) {
+      showToast('🟢 กลับมาออนไลน์แล้ว — กำลังซิงค์ข้อมูล Firebase Real-time');
+    } else {
       showToast('🟠 โหมดออฟไลน์ — การสแกนจะถูกเก็บคิวรอซิงค์อัตโนมัติ');
-    };
-
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
-  }, [showToast]);
+    }
+  }, [isOnline, showToast]);
 
   // Google Sheets Fetch
   const refreshFromGoogleSheets = useCallback(
@@ -795,12 +744,13 @@ export default function App() {
       };
 
       seenScanIdsRef.current.add(newScan.scanId);
+      localCreatedScanIdsRef.current.add(newScan.scanId);
       setScans((prev) => [newScan, ...prev]);
       setActiveScan(newScan);
       setIsSavingScan(true);
       showToast(`⏳ กำลังบันทึก: ${student.name} (${scanType})...`);
 
-      // Write via addDoc() + serverTimestamp() and ONLY confirm success after Firestore acknowledges
+      // Write deterministically via setDoc(doc(db, 'scans', scanId), payload) + serverTimestamp()
       try {
         const res = await insertScanToFirebase(
           { ...newScan, scanResult: 'สำเร็จ' },
@@ -810,8 +760,9 @@ export default function App() {
             skipStudentUpsert: isKnownStudent,
           }
         );
+        notifySyncQueueChanged();
 
-        if (res.success) {
+        if (res.success && res.confirmedServer !== false) {
           setScans((prev) =>
             prev.map((s) =>
               s.id === newScan.id || s.scanId === newScan.scanId
@@ -820,6 +771,8 @@ export default function App() {
                     firestoreDocId: res.docId,
                     dbSaved: true,
                     syncStatus: 'synced',
+                    fromCache: false,
+                    hasPendingWrites: false,
                     scanResult: 'สำเร็จ',
                     syncError: undefined,
                   }
@@ -833,11 +786,12 @@ export default function App() {
                   firestoreDocId: res.docId,
                   dbSaved: true,
                   syncStatus: 'synced',
+                  fromCache: false,
+                  hasPendingWrites: false,
                   scanResult: 'สำเร็จ',
                 }
               : curr
           );
-          setIsFirebaseConnected(true);
           showToast(
             isDropOff
               ? `✓ บันทึกสำเร็จ (${student.name} • ลงรถ)`
@@ -865,19 +819,37 @@ export default function App() {
               s.id === newScan.id || s.scanId === newScan.scanId
                 ? {
                     ...s,
+                    firestoreDocId: res.docId || s.scanId,
                     dbSaved: false,
                     syncStatus: 'pending',
-                    scanResult: 'รอซิงค์ (ออฟไลน์)',
+                    hasPendingWrites: true,
+                    scanResult: 'รอซิงค์เซิร์ฟเวอร์',
                   }
                 : s
             )
           );
-          showToast(`📡 ออฟไลน์ — บันทึกลงคิวรอซิงค์อัตโนมัติ: ${student.name}`);
+          setActiveScan((curr) =>
+            curr && (curr.id === newScan.id || curr.scanId === newScan.scanId)
+              ? {
+                  ...curr,
+                  firestoreDocId: res.docId || curr.scanId,
+                  dbSaved: false,
+                  syncStatus: 'pending',
+                  hasPendingWrites: true,
+                  scanResult: 'รอซิงค์เซิร์ฟเวอร์',
+                }
+              : curr
+          );
+          showToast(`📡 คิวรอซิงค์ขึ้น Cloud: ${student.name} (บันทึกในเครื่องแล้ว)`);
+          if (soundEnabled) {
+            speakFastSuccess(isDropOff ? 'บันทึกคิวลงรถเรียบร้อย' : 'บันทึกคิวขึ้นรถเรียบร้อย');
+          }
           triggerVibration();
         }
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.warn('Firestore scan insert failed:', err);
+        notifySyncQueueChanged();
         setScans((prev) =>
           prev.map((s) =>
             s.id === newScan.id || s.scanId === newScan.scanId
@@ -999,73 +971,93 @@ export default function App() {
   }, [registerScan, showToast]);
 
   // ==========================================
-  // FIREBASE CRUD HANDLERS: STUDENTS
+  // FIREBASE CRUD HANDLERS: STUDENTS (WITH ROLLBACK & CONFLICT DETECTION)
   // ==========================================
   const handleAddStudent = async (newStudent: Student) => {
+    const previousStudents = studentsRef.current;
     setStudents((prev) => [newStudent, ...prev.filter((s) => s.id !== newStudent.id && s.studentCode !== newStudent.studentCode)]);
-    if (isFirebaseReady()) {
+    if (isFirebaseReady() && isOnline) {
       try {
         const res = await upsertStudentToFirebase(newStudent);
         if (res.success) {
           removePendingStudent(newStudent.id || newStudent.studentCode);
+          notifySyncQueueChanged();
           showToast(`🔥 บันทึก ${newStudent.name} ลง Firebase สำเร็จ`);
           return true;
         }
-        savePendingStudent(newStudent);
-        showToast(`แจ้งเตือน Firebase (สำรองในเครื่องไว้แล้ว): ${res.error}`);
+        if (res.conflict && res.data) {
+          setStudents((prev) => prev.map((s) => (s.id === res.data!.id ? res.data! : s)));
+          showToast(`⚠️ ${res.error}`);
+          return false;
+        }
+        setStudents(previousStudents);
+        showToast(`❌ บันทึก Firebase ไม่สำเร็จ: ${res.error || ''}`);
         return false;
       } catch (err) {
-        savePendingStudent(newStudent);
-        showToast(`⚠️ บันทึก Firebase ไม่สำเร็จ (เก็บคิวในเครื่องไว้แล้ว): ${err instanceof Error ? err.message : ''}`);
+        setStudents(previousStudents);
+        showToast(`❌ บันทึก Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
         return false;
       }
     } else {
       savePendingStudent(newStudent);
-      showToast('💾 บันทึกพนักงานลงเครื่องไว้แล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
+      notifySyncQueueChanged();
+      showToast('💾 บันทึกพนักงานลงคิวเครื่องแล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
       return true;
     }
   };
 
   const handleEditStudent = async (updatedStudent: Student) => {
+    const previousStudents = studentsRef.current;
     setStudents((prev) =>
       prev.map((s) => (s.id === updatedStudent.id || s.studentCode === updatedStudent.studentCode ? updatedStudent : s))
     );
-    if (isFirebaseReady()) {
+    if (isFirebaseReady() && isOnline) {
       try {
         const res = await upsertStudentToFirebase(updatedStudent);
         if (res.success) {
           removePendingStudent(updatedStudent.id || updatedStudent.studentCode);
+          notifySyncQueueChanged();
           showToast(`🔥 อัปเดต ${updatedStudent.name} ใน Firebase สำเร็จ`);
           return true;
         }
-        savePendingStudent(updatedStudent);
-        showToast(`แจ้งเตือน Firebase (สำรองในเครื่องไว้แล้ว): ${res.error}`);
+        if (res.conflict && res.data) {
+          setStudents((prev) => prev.map((s) => (s.id === res.data!.id ? res.data! : s)));
+          showToast(`⚠️ ${res.error}`);
+          return false;
+        }
+        setStudents(previousStudents);
+        showToast(`❌ อัปเดต Firebase ไม่สำเร็จ: ${res.error || ''}`);
         return false;
       } catch (err) {
-        savePendingStudent(updatedStudent);
-        showToast(`⚠️ อัปเดต Firebase ไม่สำเร็จ (เก็บคิวในเครื่องไว้แล้ว): ${err instanceof Error ? err.message : ''}`);
+        setStudents(previousStudents);
+        showToast(`❌ อัปเดต Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
         return false;
       }
     } else {
       savePendingStudent(updatedStudent);
-      showToast('💾 บันทึกการแก้ไขลงเครื่องไว้แล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
+      notifySyncQueueChanged();
+      showToast('💾 บันทึกการแก้ไขลงคิวเครื่องแล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
       return true;
     }
   };
 
   const handleDeleteStudent = async (id: string) => {
+    const previousStudents = studentsRef.current;
     removePendingStudent(id);
     setStudents((prev) => prev.filter((s) => s.id !== id && s.studentCode !== id));
     if (isFirebaseReady()) {
       try {
         const res = await deleteStudentFromFirebase(id);
         if (res.success) {
+          notifySyncQueueChanged();
           showToast('🔥 ลบพนักงานออกจาก Firebase สำเร็จ');
         } else {
-          showToast(`แจ้งเตือน Firebase: ${res.error}`);
+          setStudents(previousStudents);
+          showToast(`❌ ลบจาก Firebase ไม่สำเร็จ: ${res.error}`);
         }
       } catch (err) {
-        showToast(`⚠️ ลบจาก Firebase ไม่สำเร็จ: ${err instanceof Error ? err.message : ''}`);
+        setStudents(previousStudents);
+        showToast(`❌ ลบจาก Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
       }
     }
   };
@@ -1076,12 +1068,13 @@ export default function App() {
     setScans([]);
     showToast('รีเซ็ตแคชหน้าจอเรียบร้อย (กำลังซิงค์ข้อมูลสดจาก Firebase Firestore)');
     if (isFirebaseReady()) {
-      refreshFromFirebase(false);
+      void refreshFromFirebase(false);
     }
   };
 
   const handleImportStudents = async (importedStudents: Student[]) => {
     if (importedStudents.length === 0) return;
+    const previousStudents = studentsRef.current;
 
     setStudents((prev) => {
       const existingMap = new Map<string, Student>();
@@ -1090,86 +1083,107 @@ export default function App() {
       return Array.from(existingMap.values());
     });
 
-    if (isFirebaseReady()) {
+    if (isFirebaseReady() && isOnline) {
       try {
         const res = await importStudentsBatchToFirebase(importedStudents);
         showToast(`🔥 นำเข้า & บันทึกลง Firebase สำเร็จ ${res.count} คน`);
       } catch (err) {
-        importedStudents.forEach(savePendingStudent);
-        showToast(`⚠️ นำเข้า Firebase ไม่สำเร็จ (เก็บคิวในเครื่องไว้แล้ว): ${err instanceof Error ? err.message : ''}`);
+        setStudents(previousStudents);
+        showToast(`❌ นำเข้า Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
       }
     } else {
       importedStudents.forEach(savePendingStudent);
-      showToast('💾 เก็บรายชื่อที่นำเข้าไว้ในเครื่องแล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
+      notifySyncQueueChanged();
+      showToast('💾 เก็บรายชื่อที่นำเข้าไว้ในคิวเครื่องแล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
     }
   };
 
   // ==========================================
-  // FIREBASE CRUD HANDLERS: CARS
+  // FIREBASE CRUD HANDLERS: CARS (WITH ROLLBACK & CONFLICT DETECTION)
   // ==========================================
   const handleAddCar = async (newCar: Car) => {
+    const previousCars = carsRef.current;
     setCars((prev) => [...prev.filter((c) => c.carID !== newCar.carID), newCar]);
-    if (isFirebaseReady()) {
+    if (isFirebaseReady() && isOnline) {
       try {
         const res = await upsertCarToFirebase(newCar);
         if (res.success) {
           removePendingCar(newCar.carID);
+          notifySyncQueueChanged();
           showToast(`🔥 บันทึกรถ ${newCar.name} ลง Firebase สำเร็จ`);
           return true;
         }
-        savePendingCar(newCar);
-        showToast(`แจ้งเตือน Firebase (สำรองในเครื่องไว้แล้ว): ${res.error}`);
+        if (res.conflict && res.data) {
+          setCars((prev) => prev.map((c) => (c.carID === res.data!.carID ? res.data! : c)));
+          showToast(`⚠️ ${res.error}`);
+          return false;
+        }
+        setCars(previousCars);
+        showToast(`❌ บันทึกรถไม่สำเร็จ: ${res.error || ''}`);
         return false;
       } catch (err) {
-        savePendingCar(newCar);
-        showToast(`⚠️ บันทึกรถลง Firebase ไม่สำเร็จ (เก็บคิวในเครื่องไว้แล้ว): ${err instanceof Error ? err.message : ''}`);
+        setCars(previousCars);
+        showToast(`❌ บันทึกรถลง Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
         return false;
       }
     } else {
       savePendingCar(newCar);
-      showToast('💾 บันทึกรถลงเครื่องไว้แล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
+      notifySyncQueueChanged();
+      showToast('💾 บันทึกรถลงคิวเครื่องแล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
       return true;
     }
   };
 
   const handleEditCar = async (updatedCar: Car) => {
+    const previousCars = carsRef.current;
     setCars((prev) => prev.map((c) => (c.carID === updatedCar.carID ? updatedCar : c)));
-    if (isFirebaseReady()) {
+    if (isFirebaseReady() && isOnline) {
       try {
         const res = await upsertCarToFirebase(updatedCar);
         if (res.success) {
           removePendingCar(updatedCar.carID);
+          notifySyncQueueChanged();
           showToast(`🔥 อัปเดตรถ ${updatedCar.name} ใน Firebase สำเร็จ`);
           return true;
         }
-        savePendingCar(updatedCar);
-        showToast(`แจ้งเตือน Firebase (สำรองในเครื่องไว้แล้ว): ${res.error}`);
+        if (res.conflict && res.data) {
+          setCars((prev) => prev.map((c) => (c.carID === res.data!.carID ? res.data! : c)));
+          showToast(`⚠️ ${res.error}`);
+          return false;
+        }
+        setCars(previousCars);
+        showToast(`❌ อัปเดตรถไม่สำเร็จ: ${res.error || ''}`);
         return false;
       } catch (err) {
-        savePendingCar(updatedCar);
-        showToast(`⚠️ อัปเดตรถลง Firebase ไม่สำเร็จ (เก็บคิวในเครื่องไว้แล้ว): ${err instanceof Error ? err.message : ''}`);
+        setCars(previousCars);
+        showToast(`❌ อัปเดตรถลง Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
         return false;
       }
     } else {
       savePendingCar(updatedCar);
-      showToast('💾 บันทึกการแก้ไขรถลงเครื่องไว้แล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
+      notifySyncQueueChanged();
+      showToast('💾 บันทึกการแก้ไขรถลงคิวเครื่องแล้ว — จะซิงค์ขึ้น Firebase อัตโนมัติเมื่อออนไลน์');
       return true;
     }
   };
 
   const handleDeleteCar = async (carId: string) => {
+    const previousCars = carsRef.current;
     removePendingCar(carId);
     setCars((prev) => prev.filter((c) => c.carID !== carId));
     if (isFirebaseReady()) {
       try {
         const res = await deleteCarFromFirebase(carId);
         if (res.success) {
+          notifySyncQueueChanged();
           showToast('🔥 ลบรถออกจาก Firebase สำเร็จ');
         } else {
-          showToast(`แจ้งเตือน Firebase: ${res.error}`);
+          setCars(previousCars);
+          showToast(`❌ ลบรถไม่สำเร็จ: ${res.error}`);
         }
       } catch (err) {
-        showToast(`⚠️ ลบรถจาก Firebase ไม่สำเร็จ: ${err instanceof Error ? err.message : ''}`);
+        setCars(previousCars);
+        showToast(`❌ ลบรถจาก Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
       }
     }
   };
@@ -1178,6 +1192,7 @@ export default function App() {
   // FIREBASE CRUD HANDLERS: SCANS
   // ==========================================
   const handleDeleteScan = async (scanId: string, firestoreDocId?: string) => {
+    const previousScans = scansRef.current;
     removePendingScan(scanId);
     setScans((prev) =>
       prev.filter(
@@ -1191,12 +1206,15 @@ export default function App() {
       try {
         const res = await deleteScanFromFirebase(scanId, firestoreDocId);
         if (res.success) {
+          notifySyncQueueChanged();
           showToast('🔥 ลบรายการสแกนจาก Firebase แล้ว');
         } else {
-          showToast(`แจ้งเตือน Firebase: ${res.error}`);
+          setScans(previousScans);
+          showToast(`❌ ลบรายการสแกนไม่สำเร็จ: ${res.error}`);
         }
       } catch (err) {
-        showToast(`⚠️ ลบจาก Firebase ไม่สำเร็จ: ${err instanceof Error ? err.message : ''}`);
+        setScans(previousScans);
+        showToast(`❌ ลบจาก Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
       }
     }
   };
@@ -1289,6 +1307,7 @@ export default function App() {
       syncPendingStudents(),
       syncPendingScans(),
     ]);
+    notifySyncQueueChanged();
     const total = carRes.syncedCount + stuRes.syncedCount + scanRes.syncedCount;
     if (total > 0) {
       showToast(`✓ ซิงค์ข้อมูลที่ค้างสำเร็จ ${total} รายการ`);
@@ -1298,6 +1317,7 @@ export default function App() {
   }, [isOnline, showToast]);
 
   const handleClearAllScans = async () => {
+    const previousScans = scansRef.current;
     clearPendingScans();
     setScans([]);
     setActiveScan(null);
@@ -1305,37 +1325,74 @@ export default function App() {
       try {
         const res = await clearAllScansInFirebase();
         if (res.success) {
+          notifySyncQueueChanged();
           showToast('🔥 ล้างประวัติสแกนใน Firebase ทั้งหมดแล้ว');
         } else {
-          showToast(`แจ้งเตือน Firebase: ${res.error || ''}`);
+          setScans(previousScans);
+          showToast(`❌ ล้างประวัติสแกนไม่สำเร็จ: ${res.error || ''}`);
         }
       } catch (err) {
-        showToast(`⚠️ ล้างประวัติสแกน Firebase ไม่สำเร็จ: ${err instanceof Error ? err.message : ''}`);
+        setScans(previousScans);
+        showToast(`❌ ล้างประวัติสแกน Firebase ไม่สำเร็จ (คืนค่าเดิมแล้ว): ${err instanceof Error ? err.message : ''}`);
       }
     }
   };
 
   // ==========================================
-  // FIREBASE CRUD HANDLERS: USERS & SETTINGS
+  // FIREBASE CRUD HANDLERS: USERS & SETTINGS (WITH ROLLBACK)
   // ==========================================
   const handleUpsertUser = async (appUser: AppUser) => {
-    await upsertUserToFirebase(appUser);
-    showToast(`🔥 บันทึกบัญชีผู้ใช้ ${appUser.name} ลง Firebase สำเร็จ`);
+    const previousUsers = usersRef.current;
+    setUsers((prev) => [
+      ...prev.filter((u) => u.user_id !== appUser.user_id),
+      appUser,
+    ].sort((a, b) => a.user_id.localeCompare(b.user_id)));
+    try {
+      await upsertUserToFirebase(appUser);
+      showToast(`🔥 บันทึกบัญชีผู้ใช้ ${appUser.name} ลง Firebase สำเร็จ`);
+    } catch (err) {
+      setUsers(previousUsers);
+      showToast(`❌ บันทึกผู้ใช้ไม่สำเร็จ: ${err instanceof Error ? err.message : ''}`);
+    }
   };
 
   const handleDeleteUser = async (userId: string) => {
-    await deleteUserFromFirebase(userId);
-    showToast('🔥 ลบบัญชีผู้ใช้จาก Firebase แล้ว');
+    const previousUsers = usersRef.current;
+    setUsers((prev) => prev.filter((u) => u.user_id !== userId));
+    try {
+      await deleteUserFromFirebase(userId);
+      showToast('🔥 ลบบัญชีผู้ใช้จาก Firebase แล้ว');
+    } catch (err) {
+      setUsers(previousUsers);
+      showToast(`❌ ลบผู้ใช้ไม่สำเร็จ: ${err instanceof Error ? err.message : ''}`);
+    }
   };
 
   const handleUpsertSetting = async (setting: SystemSetting) => {
-    await upsertSettingToFirebase(setting);
-    showToast(`🔥 บันทึกการตั้งค่า ${setting.key} ลง Firebase สำเร็จ`);
+    const previousSettings = settingsRef.current;
+    setSettings((prev) => [
+      ...prev.filter((s) => s.key !== setting.key),
+      setting,
+    ].sort((a, b) => a.key.localeCompare(b.key)));
+    try {
+      await upsertSettingToFirebase(setting);
+      showToast(`🔥 บันทึกการตั้งค่า ${setting.key} ลง Firebase สำเร็จ`);
+    } catch (err) {
+      setSettings(previousSettings);
+      showToast(`❌ บันทึกการตั้งค่าไม่สำเร็จ: ${err instanceof Error ? err.message : ''}`);
+    }
   };
 
   const handleDeleteSetting = async (key: string) => {
-    await deleteSettingFromFirebase(key);
-    showToast('🔥 ลบการตั้งค่าจาก Firebase แล้ว');
+    const previousSettings = settingsRef.current;
+    setSettings((prev) => prev.filter((s) => s.key !== key));
+    try {
+      await deleteSettingFromFirebase(key);
+      showToast('🔥 ลบการตั้งค่าจาก Firebase แล้ว');
+    } catch (err) {
+      setSettings(previousSettings);
+      showToast(`❌ ลบการตั้งค่าไม่สำเร็จ: ${err instanceof Error ? err.message : ''}`);
+    }
   };
 
   const firebaseReady = isFirebaseReady() && isFirebaseConnected;
@@ -1351,7 +1408,15 @@ export default function App() {
         <div className="statusbar-mock">
           <span id="statusTime">{currentTime}</span>
           <div className="status-right">
-            <span>{isOnline ? '🟢' : '🟠'}</span>
+            <span>
+              {syncSnapshot.status === 'offline'
+                ? '🟠'
+                : syncSnapshot.status === 'error'
+                ? '🔴'
+                : syncSnapshot.status === 'pending' || syncSnapshot.status === 'syncing'
+                ? '🔵'
+                : '🟢'}
+            </span>
             <span>📶</span>
             <span>🔋</span>
           </div>
@@ -1390,8 +1455,10 @@ export default function App() {
             cameraActive={isCameraActive}
             isOnline={isOnline}
             isFirebaseConnected={firebaseReady}
+            syncSnapshot={syncSnapshot}
             hasMoreScans={hasMoreScans}
             isLoadingMoreScans={isLoadingMoreScans}
+            latestHighlightedScanId={latestRemoteScanId}
             onLoadMoreScans={handleLoadMoreScans}
             onRetryScan={handleRetryScan}
             onSyncPending={handleSyncPendingNow}
@@ -1422,6 +1489,7 @@ export default function App() {
             scans={scans}
             users={users}
             settings={settings}
+            syncSnapshot={syncSnapshot}
             onAddStudent={handleAddStudent}
             onEditStudent={handleEditStudent}
             onDeleteStudent={handleDeleteStudent}
@@ -1435,7 +1503,10 @@ export default function App() {
             onDeleteUser={handleDeleteUser}
             onUpsertSetting={handleUpsertSetting}
             onDeleteSetting={handleDeleteSetting}
-            onCloseAdmin={() => setIsAdminDashboardOpen(false)}
+            onCloseAdmin={() => {
+              setIsAdminDashboardOpen(false);
+              void setDeviceSessionRole('Staff');
+            }}
             appsScriptUrl={appsScriptUrl}
             onUpdateAppsScriptUrl={setAppsScriptUrl}
             connectedSheetId={connectedSheetId}
@@ -1461,6 +1532,7 @@ export default function App() {
         studentCount={students.length}
         carCount={cars.length}
         scanCount={scans.length}
+        syncSnapshot={syncSnapshot}
         onSyncComplete={() => refreshFromFirebase(true)}
         onOpenFullFirebaseTab={() => {
           setAdminInitialTab('firebase');
@@ -1487,6 +1559,7 @@ export default function App() {
         onSuccess={() => {
           setIsAdminLoginOpen(false);
           setIsAdminDashboardOpen(true);
+          void setDeviceSessionRole('Admin');
           showToast('เข้าสู่ระบบแอดมินสำเร็จ');
         }}
       />
